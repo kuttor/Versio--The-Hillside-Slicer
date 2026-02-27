@@ -1,4 +1,4 @@
-# The Hillside Slicer v1.0.0
+# The Hillside Slicer v0.1-alpha
 
 ### A Granular Timestretch Sample Slicer for Noise Engineering Versio
 
