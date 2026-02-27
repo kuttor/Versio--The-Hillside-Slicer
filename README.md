@@ -114,28 +114,28 @@ Four RGB LEDs provide instant visual status:
 ## Control Surface
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│                    THE HILLSIDE SLICER                    │
-│                                                          │
+┌─────────────────────────────────────────────────────────┐
+│                    THE HILLSIDE SLICER                  │
+│                                                         │
 │   KNOB_0          KNOB_1          KNOB_2       KNOB_3   │
 │  ┌──────┐        ┌──────┐        ┌──────┐    ┌──────┐   │
 │  │START │        │LENGTH│        │SPEED │    │PITCH │   │
 │  │SLICE │        │SLICES│        │ x1   │    │ 0 st │   │
 │  └──┬───┘        └──┬───┘        └──────┘    └──────┘   │
-│     │CV=CHOKE⚡     │CV=OPEN⚡                           │
-│                                                          │
+│     │CV=CHOKE       │CV=OPEN                            │
+│                                                         │
 │   KNOB_4          KNOB_5          KNOB_6                │
 │  ┌──────┐        ┌──────┐        ┌──────┐               │
 │  │OVER- │        │LO-FI │        │ SLOT │               │
 │  │ LAP  │        │      │        │ 1-8  │               │
 │  └──────┘        └──────┘        └──┬───┘               │
-│                                     │CV=SLOT SELECT      │
-│                                                          │
-│   [SW_0: REC MODE]    [SW_1: SLICES]    [TAP]  [GATE]  │
-│    ↑IMM  •CLOCK  ↓THR   ↑16  •32  ↓64   ●      ⊡     │
-│                                                          │
-│           ◉ LED_0  ◉ LED_1  ◉ LED_2  ◉ LED_3           │
-└──────────────────────────────────────────────────────────┘
+│                                     │CV=SLOT SELECT     |
+│                                                         │
+│   [SW_0: REC MODE]    [SW_1: SLICES]    [TAP]  [GATE]   │
+│    ↑IMM  •CLOCK  ↓THR   ↑16  •32  ↓64   ●      ⊡        │
+│                                                         │
+│           ◉ LED_0  ◉ LED_1  ◉ LED_2  ◉ LED_3            │
+└─────────────────────────────────────────────────────────┘
 ```
 
 ### Parameter Reference
@@ -185,51 +185,51 @@ Brightness indicates whether slot contains audio.
 ## Recording Workflow
 
 ```
-                    ┌─────────────┐
+                    ┌──────────────┐
                     │  TURN KNOB_6 │
                     │  Select Slot │
-                    └──────┬──────┘
+                    └──────┬───────┘
                            │
-                    ┌──────┴──────┐
+                    ┌──────┴───────┐
                     │  TAP PRESS   │
                     │  Arm Record  │
-                    └──────┬──────┘
+                    └──────┬───────┘
                            │
-              ┌────────────┼────────────┐
-              │            │            │
-        ┌─────┴─────┐┌────┴────┐┌──────┴──────┐
+              ┌────────────┼───────────┐
+              │            │           │
+        ┌─────┴─────┐┌─────┴───┐┌──────┴──────┐
         │ IMMEDIATE ││  CLOCK  ││  THRESHOLD  │
         │ Records   ││ Waits   ││ Waits for   │
         │ instantly ││ for     ││ audio >     │
         │           ││ clock   ││ threshold   │
         │           ││ pulse   ││ (100ms      │
         │           ││         ││  pre-roll)  │
-        └─────┬─────┘└────┬────┘└──────┬──────┘
-              │            │            │
-              └────────────┼────────────┘
+        └─────┬─────┘└─────┬───┘└──────┬──────┘
+              │            │           │
+              └────────────┼───────────┘
                            │
                     ┌──────┴──────┐
-                    │  RECORDING   │
-                    │  LED: Red    │
-                    │  fill →→→→   │
+                    │  RECORDING  │
+                    │  LED: Red   │
+                    │  fill →→→→  │
                     └──────┬──────┘
                            │
-                    ┌──────┴──────┐
+                    ┌──────┴───────┐
                     │  TAP PRESS   │
                     │  Stop Record │
-                    └──────┬──────┘
+                    └──────┬───────┘
                            │
-                    ┌──────┴──────┐
+                    ┌──────┴───────┐
                     │  AUTO-SLICE  │
                     │  16/32/64    │
                     │  divisions   │
-                    └──────┬──────┘
+                    └──────┬───────┘
                            │
-                    ┌──────┴──────┐
+                    ┌──────┴───────┐
                     │  PLAYING     │
                     │  LED: Green  │
                     │  fill →→→→   │
-                    └─────────────┘
+                    └──────────────┘
 
         HOLD TAP 2s at any time → CLEAR current slot
 ```
@@ -252,34 +252,34 @@ Brightness indicates whether slot contains audio.
                              ┌────┴─────┐     ┌────┴────────────────────┐
                              │ RECORD   │     │ TRIGGER DETECT          │
                              │ ENGINE   │     │                         │
-                             │          │     │  KNOB_0 CV → CHOKE ⚡   │
-                             │ Pre-roll │     │  KNOB_1 CV → OPEN  ⚡   │
+                             │          │     │  KNOB_0 CV → CHOKE      │
+                             │ Pre-roll │     │  KNOB_1 CV → OPEN       │
                              │ 100ms    │     │                         │
-                             └────┬─────┘     │  No patch? → Auto mode │
+                             └────┬─────┘     │  No patch? → Auto mode  │
                                   │           └────┬────────────────────┘
                                   │                │
                     ┌─────────────┴────────────────┘
                     │
               ┌─────┴──────────────────────────────────────┐
-              │              SDRAM (64MB)                   │
+              │              SDRAM (64MB)                  │
               │                                            │
-              │  ┌────────┐ ┌────────┐     ┌────────┐     │
-              │  │ SLOT 0 │ │ SLOT 1 │ ... │ SLOT 7 │     │
-              │  │ ~10.4s │ │ ~10.4s │     │ ~10.4s │     │
-              │  │ stereo │ │ stereo │     │ stereo │     │
-              │  └────────┘ └────────┘     └────────┘     │
+              │  ┌────────┐ ┌────────┐     ┌────────┐      │
+              │  │ SLOT 0 │ │ SLOT 1 │ ... │ SLOT 7 │      │
+              │  │ ~10.4s │ │ ~10.4s │     │ ~10.4s │      │
+              │  │ stereo │ │ stereo │     │ stereo │      │
+              │  └────────┘ └────────┘     └────────┘      │
               │                                            │
               │  KNOB_6 selects active slot ◄──────────    │
               └─────────────────┬──────────────────────────┘
                                 │
-                          ┌─────┴─────┐
-                          │  SLICE    │
-                          │  ENGINE   │
-                          │           │
-                          │  KNOB_0 → Start position
-                          │  KNOB_1 → Play length
-                          │  SW_1   → 16/32/64 slices
-                          └─────┬─────┘
+                          ┌─────┴───────────────────────┐
+                          │  SLICE                      │
+                          │  ENGINE                     │
+                          │                             │
+                          │  KNOB_0 → Start position    │
+                          │  KNOB_1 → Play length       │
+                          │  SW_1   → 16/32/64 slices   │
+                          └─────┬───────────────────────┘
                                 │
                     ┌───────────┴───────────┐
                     │    GRAIN ENGINE       │
@@ -298,15 +298,15 @@ Brightness indicates whether slot contains audio.
                     │  Soft clip output     │
                     └───────────┬───────────┘
                                 │
-                          ┌─────┴─────┐
-                          │  LO-FI    │
-                          │  ENGINE   │
-                          │           │
-                          │  KNOB_5 → │
+                          ┌─────┴──────┐
+                          │  LO-FI     │
+                          │  ENGINE    │
+                          │            │
+                          │  KNOB_5 →  │
                           │  Bit crush │
                           │  +         │
                           │  Decimate  │
-                          └─────┬─────┘
+                          └─────┬──────┘
                                 │
                            OUTPUT L/R
 ```
@@ -319,21 +319,21 @@ Brightness indicates whether slot contains audio.
 
 ```
 CHOKE (hard cut):
-  ┃▓▓▓▓▓▓▓▓▓│          │▓▓▓▓▓▓▓▓▓│          │▓▓▓▓▓▓▓▓▓│
-  ┃ slice 1  │ silence  │ slice 2  │ silence  │ slice 3  │
-  ┃──────────┴──────────┴──────────┴──────────┴──────────┴──→
+  ┃▓▓▓▓▓▓▓▓▓│           │▓▓▓▓▓▓▓▓▓ │          │▓▓▓▓▓▓▓▓▓  │
+  ┃ slice 1  │ silence  │ slice 2  │ silence  │ slice 3   │
+  ┃──────────┴──────────┴──────────┴──────────┴───────────→
 
 OPEN (crossfade):
-  ┃▓▓▓▓▓▓▓▓▓▓▓▓░░░░░│                                    │
+  ┃▓▓▓▓▓▓▓▓▓▓▓▓░░░░░│                                     │
   ┃     slice 1  ╲   │                                    │
-  ┃               ╲▓▓▓▓▓▓▓▓▓▓▓▓░░░░░│                    │
+  ┃               ╲▓▓▓▓▓▓▓▓▓▓▓▓░░░░░│                     │
   ┃                    slice 2   ╲   │                    │
-  ┃                               ╲▓▓▓▓▓▓▓▓▓▓▓▓░░░░░│    │
-  ┃                                    slice 3        │    │
-  ┃───────────────────────────────────────────────────┴───→
+  ┃                               ╲▓▓▓▓▓▓▓▓▓▓▓▓░░░░░│     │
+  ┃                                    slice 3            │
+  ┃───────────────────────────────────────────────────────→
 
 AUTO (no triggers patched):
-  ┃▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓│
+  ┃▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓     │
   ┃ slice 1 → slice 2 → slice 3 → ...  (advances on clock)│
   ┃───────────────────────────────────────────────────────→
 ```
