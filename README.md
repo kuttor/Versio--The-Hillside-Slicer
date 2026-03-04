@@ -1,555 +1,375 @@
-# The Hillside Slicer v0.1-alpha
+# THE HILLSIDE SLICER
 
-### A Granular Timestretch Sample Slicer for Noise Engineering Versio
-
----
-
-```
-██╗  ██╗██╗██╗     ██╗     ███████╗██╗██████╗ ███████╗
-██║  ██║██║██║     ██║     ██╔════╝██║██╔══██╗██╔════╝
-███████║██║██║     ██║     ███████╗██║██║  ██║█████╗  
-██╔══██║██║██║     ██║     ╚════██║██║██║  ██║██╔══╝  
-██║  ██║██║███████╗███████╗███████║██║██████╔╝███████╗
-╚═╝  ╚═╝╚═╝╚══════╝╚══════╝╚══════╝╚═╝╚═════╝ ╚══════╝
-
-███████╗██╗     ██╗ ██████╗███████╗██████╗
-██╔════╝██║     ██║██╔════╝██╔════╝██╔══██╗
-███████╗██║     ██║██║     █████╗  ██████╔╝
-╚════██║██║     ██║██║     ██╔══╝  ██╔══██╗
-███████║███████╗██║╚██████╗███████╗██║  ██║
-╚══════╝╚══════╝╚═╝ ╚═════╝╚══════╝╚═╝  ╚═╝
-
-🔪 Record. Slice. Stretch. Re-Re-Re-Re-Repeat. 🔪
-```
+**Custom beat-slicing firmware for the Daisy Versio (Electrosmith)**
+**Version 0.5-alpha**
 
 ---
 
-## Overview
+## What Is It
 
-**The Hillside Slicer** is a custom firmware for the Noise Engineering Versio platform that turns your module into a stereo sample slicer with granular timestretch, dual trigger modes, and lo-fi degradation. Record audio into 8 memory slots, automatically slice it, then timestretch and pitch-shift independently using overlap-add granular synthesis.
+The Hillside Slicer turns a Daisy Versio into a stereo beat slicer. Record a loop, slice it into segments, then manipulate those slices with independent time-stretching and pitch-shifting. Designed for live performance with external clock sync, 8 sample slots, and a single-knob-per-function interface.
 
-It's built for performance. Three gestures run the entire recording system. Two trigger inputs give you rhythmic control. One knob destroys everything beautifully.
-
-**Core philosophy:** Clean timestretching with musical character control — not a granular synth, not a looper, not a delay. A sample slicer that respects your source material until you tell it not to.
+Built on the Daisy Versio hardware platform (STM32H750, Cortex-M7, 96kHz stereo audio).
 
 ---
 
-## Features
+## Hardware Panel Map
 
-### 🎙️ 8-Slot Sample Memory
-
-| Spec | Detail |
-| --- | --- |
-| **Slots** | 8 independent stereo buffers |
-| **Time Per Slot** | ~10.4 seconds at 96kHz |
-| **Total Memory** | 64MB SDRAM (full capacity) |
-| **Bit Depth** | 32-bit float |
-| **Sample Rate** | 96kHz stereo |
-
-### ✂️ Automatic Slicing
-
-Recorded audio is automatically divided into even slices on capture. Switch between 16, 32, or 64 slices per buffer with the toggle switch. Slice boundaries are calculated on the fly — no menus, no screens, no waiting.
-
-### 🔊 Granular Timestretch Engine
-
-Decoupled pitch and time via overlap-add granular synthesis:
-
-* **Speed** — 0.25x to 4x playback speed in musical ratios (/4, /3, /2, x1, x2, x3, x4)
-* **Pitch** — ±12 semitones, fully independent of transport speed
-* **Overlap** — 2x (rhythmic, choppy) to 8x (lush, smooth) grain density
-* **12-voice polyphonic** grain pool with Hanning window crossfades
-
-Slow a breakbeat to half speed without dropping pitch. Pitch a vocal up an octave without changing timing. Or crank both and enter the shadow realm.
-
-### ⚡ Dual Trigger System: Choke & Open
-
-Two CV trigger inputs repurposed from KNOB_0 and KNOB_1 jacks:
-
-| Trigger | Behavior |
-| --- | --- |
-| **Choke** (KNOB_0 CV) | Kills all grains instantly, advances to next slice, resets transport |
-| **Open** (KNOB_1 CV) | Lets current grains fade naturally via window, starts new slice underneath |
-
-**Auto-detect:** When neither CV jack is patched, the module enters auto-advance mode — slices advance automatically on the master clock. Patch detection uses activity monitoring with a 3-second timeout.
-
-### 🔥 Lo-Fi Degradation
-
-One knob sweeps from pristine 96kHz/24-bit to crushed 8kHz/8-bit:
+The firmware maps to any Versio faceplate. Reference below uses Electrosmith's standard labeling.
 
 ```
-KNOB_5 Position    Bit Depth    Sample Rate    Character
-─────────────────────────────────────────────────────────
-0%                 24-bit       96 kHz         Pristine
-25%                16-bit       48 kHz         CD quality
-50%                12-bit       26 kHz         SP-1200 zone
-75%                10-bit       16 kHz         Crunchy
-100%                8-bit        8 kHz         Destroyed
+            +----------------------------+
+            |       DAISY VERSIO         |
+            |                            |
+  KNOB_0    |  [START]       [SPEED]     |  KNOB_2
+  top-left  |                            |  top-center
+            |                            |
+  KNOB_1    |  [IN VOL]      [PITCH]     |  KNOB_3
+  bot-left  |                            |  bot-center
+            |                            |
+            |            [END]           |  KNOB_4
+            |            top-right       |
+            |                            |
+  SW_0      |  [ABC]   [GATE]   [SLOT]   |  KNOB_6
+  left      |          right-mid         |  bot-right
+            |                            |
+  SW_1      |  [XYZ]                     |  KNOB_5
+  right     |                            |  right-mid
+            |                            |
+            |  [TAP]                     |
+            |                            |
+            |  IN L  IN R  OUT L  OUT R  |
+            +----------------------------+
 ```
 
-Quadratic curve gives you more resolution in the subtle 12-16 bit sweet spot where things start getting interesting.
+### Controls -- Normal Mode
 
-### 🎙️ Three Record Modes
+| Control | Function | Range / Behavior |
+|---------|----------|-----------------|
+| KNOB_0 (top-left) | **Start Slice** | Selects which slice playback starts from. Sweeps across all available slices. |
+| KNOB_1 (bottom-left) | **Input Volume** | Controls incoming signal level for both monitoring and recording. Squared taper, 2% floor = silence. |
+| KNOB_2 (top-center) | **Speed** | Time-stretch. Noon = 1x. CW = faster (up to 4x). CCW = slower (down to 0.25x). Dead zone at noon (0.45-0.55). |
+| KNOB_3 (bottom-center) | **Pitch** | Granular pitch shift, quantized to integer semitones. Noon = unity. CW = +1 to +12 semitones. CCW = -1 to -24 semitones. Dead zone at noon (~8%). |
+| KNOB_4 (top-right) | **End Slice** | Selects which slice playback ends at. Combined with Start, defines the active playback range. |
+| KNOB_5 (right-middle) | **Slice Gate** | Controls how much of each slice plays before going silent. Full CW = 100% (full slice). CCW = shorter gate for rhythmic gating. |
+| KNOB_6 (bottom-right) | **Slot Select** | Selects active sample slot (1-8). Switching slots is instant. |
+| SW_0 (ABC) | **Record Mode** | A = Immediate, B = Clock Sync, C = Threshold |
+| SW_1 (XYZ) | **Play Mode / Settings** | X = Loop, Y = OneShot, Z = Settings Page |
+| TAP button | **Record / Stop / Clear** | Tap = toggle record/stop. Hold 1.2s = clear current slot. |
+| GATE jack | **24PPQN Clock Input** | External clock sync. 24 pulses per quarter note. Auto-detects; falls back to internal clock after 2 seconds of no signal. |
 
-| Mode | Switch Position | Behavior |
-| --- | --- | --- |
-| **Immediate** | SW_0 Up | Starts recording the instant you press TAP |
-| **Clock-Sync** | SW_0 Center | Waits for next clock pulse on Gate In, then starts |
-| **Threshold** | SW_0 Down | Arms and waits for audio input to exceed threshold, with 100ms pre-roll buffer so you never miss the transient |
+### Controls -- Settings Mode (SW_1 = Z position)
 
-### 💡 LED Feedback System
+Settings are **staged**: changes are shown on LEDs but only applied when you flip SW_1 back to Loop or OneShot. Audio continues uninterrupted while adjusting.
 
-Four RGB LEDs provide instant visual status:
+**Exception:** Output volume (KNOB_1 in settings) is real-time, not staged.
+
+| Control | Settings Function | Range |
+|---------|-------------------|-------|
+| KNOB_0 | **Bars** | 1, 2, 3, or 4 bars |
+| KNOB_1 | **Merge Destination Slot** / **Output Volume** | Slot 1-8 (for merge). Also controls end-of-chain output volume in real-time. |
+| KNOB_2 | **BPM** or **Clock Divider** | Internal: 40-200 BPM in steps of 5. When external clock detected: divider /1, /2, /4, /8. |
+| KNOB_3 | **Merge Source Slot** | Slot 1-8 (source for buffer merge) |
+| KNOB_4 | **Slices** | 4, 8, 16, 32, or 64 slices per recording |
+| KNOB_5 | **Overdub Feedback** | Full left = 1.0 (pure sum/overdub). Full right = 0.0 (full replace). |
+
+---
+
+## Workflow
+
+### Basic Recording and Playback
+
+1. Set SW_1 to **Loop** (X position).
+2. Set SW_0 to your preferred recording trigger:
+   - **A (Immediate):** Recording starts the instant you press TAP.
+   - **B (Clock Sync):** Recording arms on TAP, starts on the next clock tick (internal or external).
+   - **C (Threshold):** Recording arms on TAP, starts when incoming audio exceeds the detection threshold (~-36dB). 100ms pre-roll captures the transient that triggered it.
+3. Press **TAP** to begin recording.
+4. Recording length is determined by your BPM and Bars settings. At the default 120 BPM and 1 bar (16 clock ticks), recording is 2 seconds.
+5. Recording auto-stops when the bar count is reached. You can also tap again to stop manually.
+6. Playback begins immediately after recording stops.
+7. Use Start and End knobs to select a slice range. Use Speed and Pitch to manipulate playback.
+
+### What Happens to Knobs When Recording Starts
+
+- **Pitch** and **Speed** snap to their defaults (noon = unity). They stay frozen at default until you physically move the knob more than 3% from its current physical position. The first movement activates the knob instantly at whatever position it's at -- no catch-up hunting.
+- **Start** and **End** read their current physical position directly. Wherever the knobs are sitting when you hit record is where the slice range is set. No reset, no catch-up.
+- **Gate** resets to fully open (1.0).
+
+### OneShot Mode
+
+1. Flip SW_1 to **Y (OneShot)**.
+2. Playback stops. LEDs show dim cyan on the active slice range, indicating the slicer is armed and waiting.
+3. Press **TAP** to trigger playback. Audio plays once through the Start-to-End slice range and stops.
+4. LEDs return to dim cyan. Press TAP again to retrigger.
+
+### Slot Management
+
+- 8 independent stereo sample slots stored in SDRAM.
+- Each slot holds up to approximately 9.4 seconds at 96kHz stereo.
+- KNOB_6 switches between slots instantly. A brief LED overlay shows all 8 slot states (filled vs. empty, which is selected).
+- **Slot 1 (index 0) auto-saves to QSPI flash** after recording finishes. This slot survives power cycles and is restored on boot.
+- All other slots (2-8) are volatile and lost on power off.
+
+### Overdub
+
+1. While a slot is playing, press **TAP** to enter overdub mode.
+2. LEDs turn red (with glow trail). Incoming audio is written to the buffer at the current playback position.
+3. Press **TAP** again to exit overdub and return to normal playback.
+4. The overdub feedback setting (KNOB_5 in settings mode) controls the mix: full left = pure sum (new audio added on top), full right = full replace (new audio overwrites existing).
+5. If slot 1 was overdubbed, it auto-saves to flash.
+
+### Buffer Merge
+
+Merges one slot's audio into another (destructive operation):
+
+1. Enter Settings mode (SW_1 = Z).
+2. Set KNOB_1 to the **destination** slot and KNOB_3 to the **source** slot.
+3. Triple-tap TAP to execute:
+   - **Tap 1:** LEDs show dim solid red (2-second timeout to continue or cancel).
+   - **Tap 2:** LEDs show bright solid red (2-second timeout).
+   - **Tap 3:** Merge executes. Source audio is summed sample-by-sample into the destination buffer.
+4. White LED flash confirms success.
+5. If source is longer than destination, destination extends to match. Result is automatically re-sliced.
+
+### Clearing a Slot
+
+- In normal mode, **hold TAP for 1.2 seconds**.
+- LEDs sweep red right-to-left as a visual countdown.
+- On release, the current slot's audio is erased and playback stops.
+- Pitch shifter buffers are also cleared to prevent leftover artifacts.
+
+### Full Module Reset
+
+- In **Settings mode**, hold TAP for 2 seconds.
+- At 1.5s the LEDs flash red as a warning.
+- At 2.0s all 8 slots are cleared and config resets to defaults (1 bar, 16 slices, 120 BPM).
+
+### Bar Extension
+
+If you increase the Bars setting in settings mode (e.g., 1 bar to 2 bars), the existing recording is extended with silence to fill the new length, then re-sliced. This lets you grow a loop after the fact.
+
+---
+
+## External Clock (24PPQN)
+
+The **Gate jack** accepts standard 24 pulses-per-quarter-note clock (the same rate as MIDI clock).
+
+**Important:** The clock must be on the Gate jack (the digital input), not on any CV jack. The Versio's ADC inputs have lowpass filtering that destroys clock pulses.
+
+### How It Works
+
+The firmware counts rising edges on the Gate jack. Every 24 edges = 1 beat. BPM is derived from the time elapsed between beats. A bar boundary is calculated from your Bars setting (e.g., 4 beats x 1 bar = 4 beats per bar).
+
+### Clock Behavior by State
+
+| State | What Happens |
+|-------|-------------|
+| **Recording** | External beat ticks replace the internal clock for timing the recording. Recording length syncs to the external tempo. |
+| **Playing (Loop mode)** | Bar ticks reset the playhead to the start of the loop. This keeps the slicer locked to your sequencer's bar boundaries. |
+| **Stopped with content** | The first beat tick auto-starts loop playback and resets the bar counter. Start your sequencer and the slicer starts with it. |
+| **No clock for 2 seconds** | Auto-fallback to internal clock. Playback continues free-running. |
+
+### Clock Divider
+
+When external clock is detected, the BPM knob (KNOB_2) in settings mode becomes a clock divider:
+
+| Knob Position | Divider | Effect |
+|--------------|---------|--------|
+| Left quarter | /1 | Bar tick every bar |
+| Center-left | /2 | Bar tick every 2 bars |
+| Center-right | /4 | Bar tick every 4 bars |
+| Right quarter | /8 | Bar tick every 8 bars |
+
+This controls how often the playhead resets, effectively extending the loop period relative to the external clock.
+
+---
+
+## Play Modes
+
+### Loop (SW_1 = X)
+
+- Playback loops continuously through the Start-to-End slice range.
+- External clock bar ticks reset the playhead for sync.
+- TAP during playback enters overdub. TAP again exits.
+- Switching from OneShot to Loop auto-resumes playback if it was stopped.
+
+### OneShot (SW_1 = Y)
+
+- Plays through the slice range once, then stops.
+- LEDs show dim cyan on the active range while waiting for trigger.
+- TAP fires playback. When playback finishes, returns to waiting state.
+- Switching from Loop to OneShot stops playback immediately and enters waiting.
+
+---
+
+## DSP Architecture
+
+### Pitch Shifter
+
+4-grain OLA (Overlap-Add) time-domain granular pitch shifter. No FFT.
+
+- 4 grains at 25% phase offset. Hann windows sum to exactly 2.0 at every sample point; output normalized by 0.5 for unity gain.
+- Grain size: 4096 samples (~42ms at 96kHz).
+- Circular buffer: 16384 samples per channel (~170ms).
+- Unity bypass when pitch factor is within 1% of 1.0 (avoids processing cost and artifacts at noon).
+- Pitch range: factor 0.25 to 2.0 (corresponds to -24 to +12 semitones).
+- Quantized to integer semitones via `roundf()`.
+- Output hard-clamped to +/-1.0.
+- CPU cost: less than 1% per channel.
+
+### Time Stretcher
+
+Tape-style speed control integrated into the grain engine's playback read position.
+
+- Dead zone at noon (0.45-0.55 normalized = exactly 1.0x).
+- Outside dead zone: exponential mapping via `pow(2, mapped)` where mapped is -2.0 to +2.0.
+- Effective range: 0.25x to 4.0x speed.
+- Speed and pitch are independent. Speed changes playback rate without affecting pitch. Pitch changes pitch without affecting playback rate.
+
+### Slice Gate
+
+Controls what fraction of each slice is audible.
+
+- Full CW = entire slice plays.
+- CCW = progressively shorter gate (rhythmic gating effect).
+- 384-sample fade (~4ms) on gate close to prevent clicks.
+- State-tracked: smooth fade-out on close, instant open on open.
+
+### Crossfading
+
+Adaptive crossfade at slice boundaries and playback transitions.
+
+- Maximum crossfade: 1024 samples (~10.7ms at 96kHz).
+- Adaptive length: never exceeds 12% of slice length (keeps short slices clean).
+- Minimum: 16 samples (always click-free).
+- Applied at: slice advance, start/end knob changes, playhead resets from external clock.
+
+---
+
+## LED Feedback
+
+4 RGB LEDs provide state feedback.
 
 | State | LED Behavior |
-| --- | --- |
-| **Empty Slot** | Dim white |
-| **Armed** | Breathing orange (sine wave, 3Hz) |
-| **Recording** | Progressive red fill, current quarter flashes |
-| **Playing** | Progressive green fill, current position flashes |
-| **Slot View** | 1-4 LEDs lit — blue (slots 0-3) or purple (slots 4-7), brightness indicates content |
-| **Clearing** | Red drain animation right-to-left |
+|-------|-------------|
+| Empty | All off |
+| Armed | Steady warm orange (all 4 LEDs) |
+| Recording | Red fill sweeps left-to-right tracking record progress |
+| Playing (Loop) | Green playhead sweeps across the active range. Dim green background on in-range LEDs. Out-of-range LEDs off. |
+| OneShot Waiting | Dim cyan on in-range LEDs |
+| Overdubbing | Red playhead with glow trail (same sweep pattern as playing) |
+| Stopped | Dim green on in-range LEDs |
+| Slot Switch | Brief overlay: all 8 slots mapped to 4 LEDs (blue = even slots, purple = odd, bright = selected) |
+| Clear Sweep | Red sweep right-to-left while holding TAP |
+| Config Flash | Brief purple flash on the LED corresponding to the changed parameter |
+| Save in Progress | LED 0 dim white |
+| Save Complete | LED 0 bright green |
+
+The LED system uses a priority stack: Clear Sweep (highest) > Slot Display > Normal state rendering (lowest). Higher-priority states override lower ones.
 
 ---
 
-## Control Surface
+## Persistence
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                    THE HILLSIDE SLICER                  │
-│                                                         │
-│   KNOB_0          KNOB_1          KNOB_2       KNOB_3   │
-│  ┌──────┐        ┌──────┐        ┌──────┐    ┌──────┐   │
-│  │START │        │LENGTH│        │SPEED │    │PITCH │   │
-│  │SLICE │        │SLICES│        │ x1   │    │ 0 st │   │
-│  └──┬───┘        └──┬───┘        └──────┘    └──────┘   │
-│     │CV=CHOKE       │CV=OPEN                            │
-│                                                         │
-│   KNOB_4          KNOB_5          KNOB_6                │
-│  ┌──────┐        ┌──────┐        ┌──────┐               │
-│  │OVER- │        │LO-FI │        │ SLOT │               │
-│  │ LAP  │        │      │        │ 1-8  │               │
-│  └──────┘        └──────┘        └──┬───┘               │
-│                                     │CV=SLOT SELECT     |
-│                                                         │
-│   [SW_0: REC MODE]    [SW_1: SLICES]    [TAP]  [GATE]   │
-│    ↑IMM  •CLOCK  ↓THR   ↑16  •32  ↓64   ●      ⊡        │
-│                                                         │
-│           ◉ LED_0  ◉ LED_1  ◉ LED_2  ◉ LED_3            │
-└─────────────────────────────────────────────────────────┘
-```
-
-### Parameter Reference
-
-| Control | Function | Range | Notes |
-| --- | --- | --- | --- |
-| **KNOB_0 pot** | Start slice position | 0-100% of buffer | Selects which slice to begin playback from |
-| **KNOB_0 CV** | **CHOKE trigger** | Gate/trigger | Kills grains, advances slice, resets transport |
-| **KNOB_1 pot** | Play length | 1 slice to full buffer | How many slices to play before looping |
-| **KNOB_1 CV** | **OPEN trigger** | Gate/trigger | Natural grain fade, starts new slice |
-| **KNOB_2 + CV** | Timestretch speed | /4, /3, /2, x1, x2, x3, x4 | Musical ratios, quantized |
-| **KNOB_3 + CV** | Pitch shift | ±12 semitones | Independent of speed — true pitch/time decoupling |
-| **KNOB_4 + CV** | Grain overlap | 2x – 8x | Low = rhythmic/choppy, high = lush/smooth |
-| **KNOB_5 + CV** | Lo-fi amount | Pristine → 8-bit/8kHz | Bit depth + sample rate degrade together |
-| **KNOB_6 pot** | Slot select | Slots 1-8 | 8 positions with dead zones to prevent slipping |
-| **KNOB_6 CV** | Slot select CV | 0-5V across 8 slots | Voltage-controlled sample switching |
-| **SW_0** | Record mode | Immediate / Clock-sync / Threshold | 3-position toggle |
-| **SW_1** | Slice count | 16 / 32 / 64 | 3-position toggle |
-| **TAP short** | Record / Stop | Momentary | Press to arm/record, press again to stop |
-| **TAP hold 2s** | Clear slot | Momentary | Erases current slot |
-| **Gate In** | Master clock | Gate/clock | Clock tracking with running average (4-sample window) |
+- **Slot 1 only** (index 0) saves to 8MB QSPI flash.
+- Triggered automatically after recording finishes or after a merge into slot 1.
+- Full 32-bit float audio quality preserved (no compression or bit reduction).
+- Background save: writes in small chunks so audio DMA continues uninterrupted. QSPI and SDRAM are on separate buses.
+- Restored automatically on power-up.
+- LED 0 shows dim white during save, bright green flash when complete.
 
 ---
 
-## Slot Knob Mapping
+## Memory Layout
 
-KNOB_6 maps across 8 discrete positions with dead zones to prevent accidental switching during performance:
+| Resource | Size | Usage |
+|----------|------|-------|
+| SDRAM | ~14.4 MB | 8 stereo sample buffers (900K samples x 8 slots x 2 ch x 4 bytes) |
+| SDRAM | ~75 KB | Pre-roll buffers (9600 samples x 2 ch x 4 bytes) |
+| SRAM | ~128 KB | Pitch shifter circular buffers (16384 x 2 instances x 4 bytes) |
+| SRAM | ~30 KB | Engine state, slice headers, LED state, clock tracking, catch-up knobs |
+| QSPI Flash | up to ~7.2 MB | Slot 0 persistence (4KB header + stereo audio) |
 
-```
-Knob Position      Slot    LED Color     LED Count
-───────────────────────────────────────────────────
-0.000 – 0.110      0      Blue          ◉○○○
-0.140 – 0.235      1      Blue          ◉◉○○
-0.265 – 0.360      2      Blue          ◉◉◉○
-0.390 – 0.485      3      Blue          ◉◉◉◉
-0.515 – 0.610      4      Purple        ◉○○○
-0.640 – 0.735      5      Purple        ◉◉○○
-0.765 – 0.860      6      Purple        ◉◉◉○
-0.890 – 1.000      7      Purple        ◉◉◉◉
-
-Dead zones between positions prevent accidental switching.
-Brightness indicates whether slot contains audio.
-```
+Total SRAM usage: approximately 30% of 512KB.
 
 ---
 
-## Recording Workflow
+## Build
 
-```
-                    ┌──────────────┐
-                    │  TURN KNOB_6 │
-                    │  Select Slot │
-                    └──────┬───────┘
-                           │
-                    ┌──────┴───────┐
-                    │  TAP PRESS   │
-                    │  Arm Record  │
-                    └──────┬───────┘
-                           │
-              ┌────────────┼───────────┐
-              │            │           │
-        ┌─────┴─────┐┌─────┴───┐┌──────┴──────┐
-        │ IMMEDIATE ││  CLOCK  ││  THRESHOLD  │
-        │ Records   ││ Waits   ││ Waits for   │
-        │ instantly ││ for     ││ audio >     │
-        │           ││ clock   ││ threshold   │
-        │           ││ pulse   ││ (100ms      │
-        │           ││         ││  pre-roll)  │
-        └─────┬─────┘└─────┬───┘└──────┬──────┘
-              │            │           │
-              └────────────┼───────────┘
-                           │
-                    ┌──────┴──────┐
-                    │  RECORDING  │
-                    │  LED: Red   │
-                    │  fill →→→→  │
-                    └──────┬──────┘
-                           │
-                    ┌──────┴───────┐
-                    │  TAP PRESS   │
-                    │  Stop Record │
-                    └──────┬───────┘
-                           │
-                    ┌──────┴───────┐
-                    │  AUTO-SLICE  │
-                    │  16/32/64    │
-                    │  divisions   │
-                    └──────┬───────┘
-                           │
-                    ┌──────┴───────┐
-                    │  PLAYING     │
-                    │  LED: Green  │
-                    │  fill →→→→   │
-                    └──────────────┘
-
-        HOLD TAP 2s at any time → CLEAR current slot
-```
-
----
-
-## Signal Flow
-
-```
-                                              ┌──────────┐
-                                              │ GATE IN  │
-                                              │ (clock)  │
-                                              └────┬─────┘
-                                                   │
-    AUDIO IN L/R ─────────────────┐           ┌────┴─────┐
-                                  │           │  CLOCK   │
-                                  │           │ TRACKER  │
-                                  │           └────┬─────┘
-                                  │                │
-                             ┌────┴─────┐     ┌────┴────────────────────┐
-                             │ RECORD   │     │ TRIGGER DETECT          │
-                             │ ENGINE   │     │                         │
-                             │          │     │  KNOB_0 CV → CHOKE      │
-                             │ Pre-roll │     │  KNOB_1 CV → OPEN       │
-                             │ 100ms    │     │                         │
-                             └────┬─────┘     │  No patch? → Auto mode  │
-                                  │           └────┬────────────────────┘
-                                  │                │
-                    ┌─────────────┴────────────────┘
-                    │
-              ┌─────┴──────────────────────────────────────┐
-              │              SDRAM (64MB)                  │
-              │                                            │
-              │  ┌────────┐ ┌────────┐     ┌────────┐      │
-              │  │ SLOT 0 │ │ SLOT 1 │ ... │ SLOT 7 │      │
-              │  │ ~10.4s │ │ ~10.4s │     │ ~10.4s │      │
-              │  │ stereo │ │ stereo │     │ stereo │      │
-              │  └────────┘ └────────┘     └────────┘      │
-              │                                            │
-              │  KNOB_6 selects active slot ◄──────────    │
-              └─────────────────┬──────────────────────────┘
-                                │
-                          ┌─────┴───────────────────────┐
-                          │  SLICE                      │
-                          │  ENGINE                     │
-                          │                             │
-                          │  KNOB_0 → Start position    │
-                          │  KNOB_1 → Play length       │
-                          │  SW_1   → 16/32/64 slices   │
-                          └─────┬───────────────────────┘
-                                │
-                    ┌───────────┴───────────┐
-                    │    GRAIN ENGINE       │
-                    │    (12 voices)        │
-                    │                       │
-                    │  KNOB_2 → Speed       │
-                    │  KNOB_3 → Pitch       │
-                    │  KNOB_4 → Overlap     │
-                    │                       │
-                    │  Transport ──→ speed  │
-                    │  Grains ────→ pitch   │
-                    │  (independent)        │
-                    │                       │
-                    │  Hanning windows      │
-                    │  Overlap-add sum      │
-                    │  Soft clip output     │
-                    └───────────┬───────────┘
-                                │
-                          ┌─────┴──────┐
-                          │  LO-FI     │
-                          │  ENGINE    │
-                          │            │
-                          │  KNOB_5 →  │
-                          │  Bit crush │
-                          │  +         │
-                          │  Decimate  │
-                          └─────┬──────┘
-                                │
-                           OUTPUT L/R
-```
-
----
-
-## Trigger Behavior
-
-### Choke vs Open — What's the Difference?
-
-```
-CHOKE (hard cut):
-  ┃▓▓▓▓▓▓▓▓▓│           │▓▓▓▓▓▓▓▓▓ │          │▓▓▓▓▓▓▓▓▓  │
-  ┃ slice 1  │ silence  │ slice 2  │ silence  │ slice 3   │
-  ┃──────────┴──────────┴──────────┴──────────┴───────────→
-
-OPEN (crossfade):
-  ┃▓▓▓▓▓▓▓▓▓▓▓▓░░░░░│                                     │
-  ┃     slice 1  ╲   │                                    │
-  ┃               ╲▓▓▓▓▓▓▓▓▓▓▓▓░░░░░│                     │
-  ┃                    slice 2   ╲   │                    │
-  ┃                               ╲▓▓▓▓▓▓▓▓▓▓▓▓░░░░░│     │
-  ┃                                    slice 3            │
-  ┃───────────────────────────────────────────────────────→
-
-AUTO (no triggers patched):
-  ┃▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓     │
-  ┃ slice 1 → slice 2 → slice 3 → ...  (advances on clock)│
-  ┃───────────────────────────────────────────────────────→
-```
-
----
-
-## Installation
-
-### Prerequisites
-
-* [Daisy Toolchain](https://daisy.audio) (arm-none-eabi-gcc)
-* [libDaisy](https://github.com/electro-smith/libDaisy) — built (`make` in libDaisy directory)
-* [DaisySP](https://github.com/electro-smith/DaisySP) — built (`make` in DaisySP directory)
-
-### Build
+Requires the [DaisyExamples](https://github.com/electro-smith/DaisyExamples) environment with libDaisy and DaisySP compiled for the Versio platform.
 
 ```bash
-# Directory structure should be:
-#   YourFolder/
-#   ├── libDaisy/          (built)
-#   ├── DaisySP/           (built)
-#   └── HillsideSlicer/    (this project)
-
-cd HillsideSlicer
-
-# Verify Makefile paths point to your lib locations:
-#   LIBDAISY_DIR = ../../libDaisy
-#   DAISYSP_DIR  = ../../DaisySP
-
+# From the HillsideSlicer directory:
 make
-```
 
-### Flash
-
-```bash
-# Option 1: DFU (hold BOOT on Daisy Seed, plug USB, release BOOT)
+# Flash via USB (device in DFU mode):
 make program-dfu
-
-# Option 2: Daisy Web Programmer
-# https://electro-smith.github.io/Programmer/
-# Drag build/HillsideSlicer.bin onto the page
 ```
 
-### Restore Stock Firmware
+### Source Files
 
-Flash any official Noise Engineering firmware via the [NE Portal](https://portal.noiseengineering.us/).
+| File | Purpose |
+|------|---------|
+| `HillsideSlicer.cpp` | Main firmware: audio callback, control routing, state machine, settings page |
+| `slice_engine.h` | Recording engine, slice math, overdub, buffer merge, bar extension |
+| `grain_engine.h` | Playback engine: tape-style speed, slice gate with fade, crossfading, pitch shift integration |
+| `pitch_shifter.h` | 4-grain OLA granular pitch shifter |
+| `led_manager.h` | LED rendering for all states with priority system |
+| `gate_detect.h` | Gate/CV edge detection, clock tracking, 24PPQN clock detector |
+| `persistence_manager.h` | QSPI flash save/restore for slot 0 |
+| `lofi.h` | Lo-fi effect module (present but not currently wired into signal chain) |
+| `Makefile` | Build configuration for arm-none-eabi toolchain |
 
 ---
 
-## Usage Tips
+## Version History
 
-### First Boot
+### 0.5-alpha (current)
 
-1. Power on — 4 dim white LEDs confirm empty slots
-2. Turn **KNOB_6** — LEDs shift between blue and purple as you sweep slots
-3. Patch audio into **IN L** (and optionally **IN R**)
-4. Set **SW_0** to Immediate (up position)
-5. Press **TAP** — LED breathes orange (armed), then red (recording)
-6. Press **TAP** again to stop — audio is sliced, LED goes green
-7. You're playing. Turn knobs.
+- External 24PPQN clock on Gate jack with auto-detect and 2-second fallback to internal clock.
+- Bar-sync playback: external clock resets playhead on bar boundaries in loop mode.
+- Auto-start: clock arriving while stopped with content triggers loop playback.
+- Clock divider in settings mode (BPM knob becomes /1, /2, /4, /8 selector when externally clocked).
+- OneShot mode: playback stops on mode switch, shows dim cyan LEDs while waiting, TAP retriggers.
+- Clean OneShot-to-Loop and Loop-to-OneShot transitions.
+- First-move-activates for speed/pitch knobs on record start (frozen at default until moved 3%).
+- Start/End knobs use physical position on record arm (no reset, no catch-up).
+- Threshold recording sensitivity lowered to ~-36dB (was ~-26dB).
+- Single-slice LED display fix (at least 1 LED lights when playing only the first slice).
 
-### Classic Beat Slicer
+### 0.4-alpha
 
-1. Set **SW_1** to 16 slices
-2. Record a 4-bar drum loop
-3. Patch clock to **Gate In**, choke trigger to **KNOB_0 CV**
-4. Send 16th-note triggers to choke input
-5. Set **Speed** to x1, **Pitch** to 0
-6. Turn **Start Slice** to scan through the break
+- 4-grain pitch shifter replacing 2-grain OLA (eliminates tremolo at high pitch factors).
+- Increased crossfade to 1024 samples and gate fade to 384 samples for cleaner transitions.
+- Output volume control in settings mode (KNOB_1, real-time).
+- Grain size doubled to 4096 samples for smoother pitch shifting.
 
-### Timestretched Pads
+### 0.3-alpha
 
-1. Record a chord or texture
-2. Set **Speed** to /4 (quarter speed)
-3. Set **Overlap** to 8x (full smooth)
-4. **Pitch** to taste
-5. Patch nothing to triggers — let it auto-advance
-6. Float away
-
-### SP-1200 Mode
-
-1. Record anything
-2. Crank **KNOB_5** to ~50% for the 12-bit/26kHz sweet spot
-3. Set **SW_1** to 32 slices
-4. Choke triggers at 8th notes
-5. Congratulations, it's 1987
-
-### Voltage-Controlled Sample Switching
-
-1. Record different material into several slots
-2. Patch a step sequencer or LFO into **KNOB_6 CV**
-3. Each voltage step selects a different slot
-4. Combine with choke triggers for sample-hopping chaos
-5. This is generative sample mangling
-
-### Glitch Destruction
-
-1. Record anything clean
-2. **Speed** at /2, **Pitch** at +7 semitones
-3. **Overlap** at 2x (choppy grains)
-4. **Lo-fi** at 75%+
-5. Open triggers with fast irregular timing
-6. Now you're making Autechre jealous
+- Granular pitch shifter (replaced earlier WSOLA and phase vocoder attempts).
+- Adaptive crossfade system at slice boundaries.
+- ResyncSlices for live slice reconfiguration.
+- Catch-up knobs on mode transitions.
+- LED glow trail system for playback and overdub visualization.
+- QSPI persistence for slot 0.
+- Buffer merge with triple-tap confirmation.
+- Overdub with adjustable feedback.
+- Settings page with staged parameters.
+- Bar extension (increase bars setting to extend existing recording with silence).
+- Full module reset (hold TAP 2s in settings).
 
 ---
 
-## Technical Specifications
+## Known Limitations
 
-| Specification | Value |
-| --- | --- |
-| **Platform** | Noise Engineering Versio (Daisy Seed) |
-| **Sample Rate** | 96 kHz |
-| **Bit Depth** | 32-bit float (internal) |
-| **Audio I/O** | Stereo in / Stereo out |
-| **Channels** | 2 (stereo) |
-| **Memory Slots** | 8 × ~10.4 seconds |
-| **Total SDRAM** | 64 MB (95.48% utilized) |
-| **Flash Usage** | 88.6 KB (67.61% of 128 KB) |
-| **Grain Voices** | 12 polyphonic |
-| **Grain Size Range** | 2.7ms – 200ms (internal, not user-facing) |
-| **Default Grain Size** | ~50ms at 0.5 normalized |
-| **Slice Counts** | 16 / 32 / 64 (switch-selectable) |
-| **Pre-roll Buffer** | 100ms (9600 samples) for threshold mode |
-| **Clock Timeout** | 4 seconds (auto-detect lost clock) |
-| **Patch Detection** | 3-second activity timeout on CV jacks |
-| **Latency** | Zero (direct synthesis) |
-| **Toolchain** | arm-none-eabi-gcc (Daisy Toolchain) |
-
-### Granular Engine Internals
-
-```
-Grain Size:      256 – 19,200 samples (2.7ms – 200ms)
-Default:         4,800 samples (~50ms)
-Window:          Hanning — 0.5 × (1 - cos(2π × phase))
-Overlap:         2x – 8x (KNOB_4)
-Normalization:   2.0 / overlap (compensates Hanning sum)
-Grain Interval:  grain_size / overlap
-Voice Stealing:  Oldest grain (highest phase) gets replaced
-Output Clip:     Soft clip via fast tanh approximation
-```
-
-### Lo-Fi Engine Internals
-
-```
-Bit Reduction:   Quantize to 2^N levels (24 → 16 → 12 → 10 → 8)
-Decimation:      Hold-and-repeat (counter-based)
-Rate Sweep:      96kHz → 48 → 26 → 16 → 8kHz
-Curve:           Quadratic (more resolution in subtle range)
-```
+- Only slot 1 persists across power cycles (QSPI flash storage constraint).
+- Maximum recording length per slot: ~9.4 seconds at 96kHz.
+- Pitch range is asymmetric: +12 semitones up, -24 semitones down (pitch factor clamped to 0.25-2.0).
+- At extreme speed and pitch combinations, audio quality degrades (expected with granular processing).
+- External clock must use the Gate jack, not any CV jack. The Versio ADC inputs have lowpass filtering that destroys fast clock pulses.
+- Lo-fi module (`lofi.h`) exists in the codebase but is not currently connected to the signal chain.
 
 ---
 
-## File Structure
-
-```
-HillsideSlicer/
-├── HillsideSlicer.cpp    Main firmware — audio callback, control logic, init
-├── grain_engine.h        Granular timestretch engine (12-voice overlap-add)
-├── slice_engine.h        Recording, buffer management, slice calculation
-├── gate_detect.h         Gate detection, clock tracking, trigger handling
-├── lofi.h                Bit crush + sample rate decimation
-├── led_manager.h         4× RGB LED state machine with animations
-├── Makefile              Build configuration for Daisy toolchain
-└── README.md             You are here
-```
-
----
-
-## Changelog
-
-### v1.0.0 (February 2026)
-
-* 🎉 **Initial release**
-* ✂️ 8-slot stereo sample slicer at 96kHz
-* 🔊 12-voice granular timestretch with independent pitch/time
-* ⚡ Dual choke/open trigger system with auto-detect
-* 🔥 Lo-fi degradation (24-bit pristine → 8-bit crushed)
-* 🎙️ Three record modes: Immediate, Clock-sync, Threshold (with 100ms pre-roll)
-* 💡 4× RGB LED feedback with animations
-* 🎛️ Voltage-controllable slot selection
-
----
-
-## Credits
-
-**The Hillside Slicer** was built for the [Noise Engineering Versio](https://noiseengineering.us/) platform using [Electrosmith's Daisy Seed](https://www.electro-smith.com/daisy/daisy) and [libDaisy](https://github.com/electro-smith/libDaisy).
-
-Inspired by:
-
-* The E-mu SP-1200 and its beautiful 12-bit grit
-* Granular synthesis techniques from Curtis Roads and Barry Truax
-* The "just make it simple" design philosophy of hardware that gets out of your way
-* Coffee, frustration, and the Reno high desert
-
----
-
-## License
-
-This firmware is provided as-is for use with Noise Engineering Versio hardware. Do whatever you want with it. Make music. Break things. Share it.
-
----
-
-## Support
-
-Got bugs? Got ideas? Got weird sounds you made with this thing?
-
-**GitHub**: [github.com/kuttor/Versio--Hillside-Slicer](https://github.com/kuttor/Versio--Hillside-Slicer)
-
----
-
-```
-        🔪🔪🔪🔪🔪🔪🔪🔪
-      🔪                🔪
-     🔪   SLICE  IT    🔪
-      🔪                🔪
-        🔪🔪🔪🔪🔪🔪🔪🔪
-```
-
-**The Hillside Slicer** — *64 megabytes of bad decisions.*
+*Custom firmware by Andy. Built on the Electrosmith Daisy platform.*

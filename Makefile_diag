@@ -1,0 +1,13 @@
+# Hillside Slicer - Diagnostic Test Firmware
+TARGET = DiagTest
+
+# Sources - just the test file, no extra headers needed
+CPP_SOURCES = DiagTest.cpp
+
+# Library Locations - adjust if your directory structure differs
+LIBDAISY_DIR = ../../libDaisy
+DAISYSP_DIR  = ../../DaisySP
+
+# Versio-specific: Use the Daisy Seed linker script
+SYSTEM_FILES_DIR = $(LIBDAISY_DIR)/core
+include $(SYSTEM_FILES_DIR)/Makefile

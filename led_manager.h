@@ -4,224 +4,291 @@
 #include "slice_engine.h"
 
 /**
- * LedManager - Controls the 4 RGB LEDs based on module state.
- * 
- * States:
- *   EMPTY     → All dim white
- *   ARMED     → All pulsing orange (breathing)
- *   RECORDING → Progressive red fill (quarter by quarter)
- *   PLAYING   → Progressive green showing playback position
- *   SLOT_VIEW → Blue (persistent) or purple (session) slot indicator
- *   CLEARING  → Red drain animation
+ * LED Manager for Hillside Slicer
+ *
+ * 4 RGB LEDs on Daisy Versio.
+ *
+ * RENDERING PRIORITY (highest first):
+ *   1. Clear sweep — red animation while holding TAP
+ *   2. Slot display — brief overlay on slot change
+ *   3. State: Empty / Armed / Recording / Playing / Overdub / Stopped
+ *
+ * PLAYBACK RANGE RULE:
+ *   LEDs outside the start→end range are ALWAYS off (0,0,0).
+ *   This applies in both PLAYING and OVERDUBBING states.
+ *   BG brightness only shows on in-range, non-playhead LEDs.
  */
 class LedManager
 {
   public:
-    struct LedColor
-    {
-        float r = 0.0f;
-        float g = 0.0f;
-        float b = 0.0f;
-    };
+    struct LedColor { float r = 0.0f; float g = 0.0f; float b = 0.0f; };
 
     LedManager() {}
+    void Init(float sr) { (void)sr; }
 
-    void Init(float sr)
-    {
-        sample_rate_   = sr;
-        phase_         = 0.0f;
-        clear_progress_ = 0.0f;
-        force_slot_display_ = false;
-        slot_display_timer_ = 0;
-    }
-
-    /** Call once per control-rate update */
     void Update(RecordState state, float progress, uint32_t current_slot,
-                const RecordState* slot_states, bool clearing)
+                const RecordState* slot_states, float clear_progress,
+                bool show_range, uint32_t range_start,
+                uint32_t range_end, uint32_t total_slices,
+                bool cyan_flash, uint32_t cyan_slice,
+                bool oneshot_waiting = false)
     {
-        phase_ += 3.0f / sample_rate_ * 256.0f; // ~3Hz breathing rate at 256-sample blocks
-        if(phase_ > 6.2831853f)
-            phase_ -= 6.2831853f;
+        (void)show_range;  // Range is ALWAYS applied during playback
+        (void)cyan_flash;
+        (void)cyan_slice;
 
-        // Slot display timer countdown
+        if(slot_display_timer_ > 0)
+            slot_display_timer_--;
+
+        // ── PRIORITY 1: Clear sweep (user holding TAP) ─────
+        if(clear_progress > 0.001f)
+        {
+            slot_display_timer_ = 0;
+            RenderClearSweep(clear_progress);
+            return;
+        }
+
+        // ── PRIORITY 2: Slot display overlay ────────────────
         if(slot_display_timer_ > 0)
         {
-            slot_display_timer_--;
-            if(slot_display_timer_ == 0)
-                force_slot_display_ = false;
+            RenderSlotDisplay(current_slot, slot_states);
+            return;
         }
 
-        if(clearing)
+        // ── PRIORITY 3: State rendering ─────────────────────
+        switch(state)
         {
-            // Clearing animation: red drain from right to left
-            RenderClearing();
-        }
-        else if(force_slot_display_)
-        {
-            // Show slot status (after knob turn)
-            RenderSlotView(current_slot, slot_states);
-        }
-        else
-        {
-            switch(state)
-            {
-                case RecordState::EMPTY:
-                    RenderEmpty();
-                    break;
-                case RecordState::ARMED:
-                    RenderArmed();
-                    break;
-                case RecordState::RECORDING:
-                    RenderRecording(progress);
-                    break;
-                case RecordState::PLAYING:
-                    RenderPlaying(progress);
-                    break;
-                case RecordState::CLEARING:
-                    RenderClearing();
-                    break;
-            }
+            case RecordState::EMPTY:
+                RenderAllOff();
+                break;
+
+            case RecordState::ARMED:
+                RenderArmed();
+                break;
+
+            case RecordState::RECORDING:
+                RenderRecording(progress);
+                break;
+
+            case RecordState::PLAYING:
+                if(oneshot_waiting)
+                    RenderOneshotWaiting(range_start, range_end, total_slices);
+                else
+                    RenderPlayback(progress, range_start, range_end,
+                                   total_slices, false);
+                break;
+
+            case RecordState::OVERDUBBING:
+                RenderPlayback(progress, range_start, range_end,
+                               total_slices, true);
+                break;
+
+            case RecordState::STOPPED:
+                RenderStopped(range_start, range_end, total_slices);
+                break;
+
+            case RecordState::CLEARING:
+                RenderAllOff();
+                break;
         }
     }
 
-    /** Force slot display mode (called when slot knob changes) */
-    void ShowSlotDisplay(uint32_t duration_ticks = 400)
+    void ShowSlotDisplay(uint32_t ticks = 400) { slot_display_timer_ = ticks; }
+
+    const LedColor& GetLed(uint32_t i) const
     {
-        force_slot_display_ = true;
-        slot_display_timer_ = duration_ticks;
+        return (i < 4) ? leds_[i] : leds_[0];
     }
 
-    /** Get LED color for a given index (0-3) */
-    const LedColor& GetLed(uint32_t idx) const
+    void OverrideLed(uint32_t i, float r, float g, float b)
     {
-        return (idx < 4) ? leds_[idx] : leds_[0];
+        if(i < 4) leds_[i] = {r, g, b};
     }
 
   private:
-    void RenderEmpty()
+    // Background brightness for in-range, non-playhead LEDs.
+    // 0.10 is clearly visible and well above PWM flicker threshold.
+    static constexpr float BG = 0.10f;
+
+    // ── Render functions ────────────────────────────────────
+
+    void RenderAllOff()
     {
-        // Dim white on all LEDs
         for(int i = 0; i < 4; i++)
-        {
-            leds_[i] = {0.05f, 0.05f, 0.05f};
-        }
+            leds_[i] = {0.0f, 0.0f, 0.0f};
     }
 
     void RenderArmed()
     {
-        // All LEDs pulsing orange (breathing)
-        float breath = (sinf(phase_) + 1.0f) * 0.5f; // 0-1 sine breathing
-        breath = breath * breath; // Quadratic for more pleasing curve
-        float r = breath * 0.8f;
-        float g = breath * 0.3f;
+        // Steady warm orange on all 4 LEDs
         for(int i = 0; i < 4; i++)
-        {
-            leds_[i] = {r, g, 0.0f};
-        }
+            leds_[i] = {0.3f, 0.08f, 0.0f};
     }
 
     void RenderRecording(float progress)
     {
-        // Progressive red fill - each LED = 25% of recording
-        // Current quarter flashes, completed quarters solid
+        // Red fill left→right matching record progress
+        if(progress > 1.0f) progress = 1.0f;
         for(int i = 0; i < 4; i++)
         {
-            float quarter_start = static_cast<float>(i) * 0.25f;
-            float quarter_end   = quarter_start + 0.25f;
+            float q_start = static_cast<float>(i) * 0.25f;
+            float q_end   = q_start + 0.25f;
 
-            if(progress >= quarter_end)
+            if(progress >= q_end)
+                leds_[i] = {0.6f, 0.0f, 0.0f};      // Filled
+            else if(progress >= q_start)
             {
-                // This quarter is complete: solid red
-                leds_[i] = {0.8f, 0.0f, 0.0f};
-            }
-            else if(progress >= quarter_start)
-            {
-                // Currently recording this quarter: flashing red
-                float flash = (sinf(phase_ * 4.0f) + 1.0f) * 0.5f;
-                leds_[i] = {flash * 0.9f, 0.0f, 0.0f};
+                float f = (progress - q_start) / 0.25f;
+                leds_[i] = {0.25f + f * 0.35f, 0.0f, 0.0f}; // Partial
             }
             else
+                leds_[i] = {0.0f, 0.0f, 0.0f};      // Not yet
+        }
+    }
+
+    /**
+     * Playback rendering — used for both PLAYING and OVERDUBBING.
+     *
+     * @param overdub  true = red colors (overdubbing), false = green (playing)
+     *
+     * Range rule: LEDs whose quadrant midpoint falls OUTSIDE the
+     * start→end range are completely off. No background, no playhead.
+     */
+    void RenderPlayback(float progress, uint32_t range_start,
+                        uint32_t range_end, uint32_t total_slices,
+                        bool overdub)
+    {
+        if(total_slices == 0) { RenderAllOff(); return; }
+
+        // Normalize range to 0.0–1.0
+        float norm_s = static_cast<float>(range_start)
+                     / static_cast<float>(total_slices);
+        float norm_e = static_cast<float>(range_end + 1)
+                     / static_cast<float>(total_slices);
+        if(norm_e > 1.0f) norm_e = 1.0f;
+        if(norm_s >= norm_e) norm_e = norm_s + 0.01f;
+
+        // Playhead absolute position
+        float abs_pos = norm_s + progress * (norm_e - norm_s);
+        int head_q = static_cast<int>(abs_pos * 4.0f);
+        if(head_q > 3) head_q = 3;
+        if(head_q < 0) head_q = 0;
+
+        for(int i = 0; i < 4; i++)
+        {
+            // Use quadrant midpoint for stable range decision
+            float q_mid = (static_cast<float>(i) + 0.5f) * 0.25f;
+
+            // RANGE CHECK: outside range → completely off
+            if(q_mid < norm_s || q_mid >= norm_e)
             {
-                // Not yet reached: dark
                 leds_[i] = {0.0f, 0.0f, 0.0f};
+                continue;
             }
-        }
-    }
 
-    void RenderPlaying(float progress)
-    {
-        // Progressive green fill - same logic as recording but green
-        for(int i = 0; i < 4; i++)
-        {
-            float quarter_start = static_cast<float>(i) * 0.25f;
-            float quarter_end   = quarter_start + 0.25f;
-
-            if(progress >= quarter_end)
+            // PLAYHEAD: full brightness
+            if(i == head_q)
             {
-                // Passed: solid green
-                leds_[i] = {0.0f, 0.6f, 0.0f};
-            }
-            else if(progress >= quarter_start)
-            {
-                // Current position: bright flashing green
-                float flash = (sinf(phase_ * 3.0f) + 1.0f) * 0.5f;
-                leds_[i] = {0.0f, 0.3f + flash * 0.5f, 0.0f};
-            }
-            else
-            {
-                // Not yet: dim green
-                leds_[i] = {0.0f, 0.05f, 0.0f};
-            }
-        }
-    }
-
-    void RenderSlotView(uint32_t current_slot, const RecordState* slot_states)
-    {
-        // Show slot number (1-8) using LED count and color
-        // Slots 0-3: blue (persistent concept), Slots 4-7: purple (session)
-        bool persistent = (current_slot < 4);
-        uint32_t display_count = (current_slot % 4) + 1; // 1-4 LEDs
-
-        bool has_content = (slot_states[current_slot] == RecordState::PLAYING);
-
-        for(uint32_t i = 0; i < 4; i++)
-        {
-            if(i < display_count)
-            {
-                float brightness = has_content ? 0.8f : 0.15f;
-                if(persistent)
-                    leds_[i] = {0.0f, brightness * 0.2f, brightness}; // Blue
+                if(overdub)
+                    leds_[i] = {1.0f, 0.0f, 0.0f};   // Red
                 else
-                    leds_[i] = {brightness * 0.6f, 0.0f, brightness}; // Purple
+                    leds_[i] = {0.0f, 1.0f, 0.0f};   // Green
             }
             else
             {
-                leds_[i] = {0.0f, 0.0f, 0.0f};
+                // IN-RANGE BACKGROUND: dim steady
+                if(overdub)
+                    leds_[i] = {BG, 0.0f, 0.0f};     // Dim red
+                else
+                    leds_[i] = {0.0f, BG, 0.0f};     // Dim green
             }
         }
     }
 
-    void RenderClearing()
+    void RenderOneshotWaiting(uint32_t rs, uint32_t re, uint32_t ts)
     {
-        // Red drain animation from right to left
-        clear_progress_ += 0.005f;
-        if(clear_progress_ > 1.0f)
-            clear_progress_ = 1.0f;
-
-        for(int i = 3; i >= 0; i--)
+        if(ts == 0) { RenderAllOff(); return; }
+        float ns = static_cast<float>(rs) / static_cast<float>(ts);
+        float ne = static_cast<float>(re + 1) / static_cast<float>(ts);
+        if(ne > 1.0f) ne = 1.0f;
+        if(ns >= ne) ne = ns + 0.01f;
+        for(int i = 0; i < 4; i++)
         {
-            float threshold = 1.0f - (static_cast<float>(i) + 1.0f) * 0.25f;
-            if(clear_progress_ > threshold)
-                leds_[i] = {0.0f, 0.0f, 0.0f}; // Drained
+            float qm = (static_cast<float>(i) + 0.5f) * 0.25f;
+            if(qm >= ns && qm < ne)
+                leds_[i] = {0.0f, BG * 0.5f, BG};
             else
-                leds_[i] = {0.5f, 0.0f, 0.0f}; // Still red
+                leds_[i] = {0.0f, 0.0f, 0.0f};
         }
     }
 
-    LedColor leds_[4];
-    float    sample_rate_      = 96000.0f;
-    float    phase_            = 0.0f;
-    float    clear_progress_   = 0.0f;
-    bool     force_slot_display_ = false;
-    uint32_t slot_display_timer_ = 0;
+    void RenderStopped(uint32_t range_start, uint32_t range_end,
+                       uint32_t total_slices)
+    {
+        // Dim green on in-range LEDs, off on out-of-range
+        if(total_slices == 0) { RenderAllOff(); return; }
+        float norm_s = static_cast<float>(range_start)
+                     / static_cast<float>(total_slices);
+        float norm_e = static_cast<float>(range_end + 1)
+                     / static_cast<float>(total_slices);
+        if(norm_e > 1.0f) norm_e = 1.0f;
+        if(norm_s >= norm_e) norm_e = norm_s + 0.01f;
+
+        for(int i = 0; i < 4; i++)
+        {
+            float q_mid = (static_cast<float>(i) + 0.5f) * 0.25f;
+            if(q_mid >= norm_s && q_mid < norm_e)
+                leds_[i] = {0.0f, BG, 0.0f};
+            else
+                leds_[i] = {0.0f, 0.0f, 0.0f};
+        }
+    }
+
+    /** Red sweep RIGHT→LEFT while holding TAP to clear */
+    void RenderClearSweep(float progress)
+    {
+        if(progress > 1.0f) progress = 1.0f;
+        for(int i = 0; i < 4; i++)
+        {
+            // LED 3 fills first (progress 0-25%), LED 0 fills last (75-100%)
+            float q_start = static_cast<float>(3 - i) * 0.25f;
+            float q_end   = q_start + 0.25f;
+
+            if(progress >= q_end)
+                leds_[i] = {0.8f, 0.0f, 0.0f};       // Full
+            else if(progress >= q_start)
+            {
+                float f = (progress - q_start) / 0.25f;
+                leds_[i] = {0.2f + f * 0.6f, 0.0f, 0.0f}; // Filling
+            }
+            else
+                leds_[i] = {0.0f, 0.0f, 0.0f};       // Not yet
+        }
+    }
+
+    /** 8 slots on 4 LEDs: even=blue, odd=purple */
+    void RenderSlotDisplay(uint32_t current_slot,
+                           const RecordState* slot_states)
+    {
+        for(int i = 0; i < 4; i++)
+        {
+            uint32_t s_even = i * 2;
+            uint32_t s_odd  = i * 2 + 1;
+            bool has_even = (slot_states[s_even] != RecordState::EMPTY);
+            bool has_odd  = (slot_states[s_odd]  != RecordState::EMPTY);
+
+            if(current_slot == s_even)
+                leds_[i] = {0.0f, 0.0f, 0.8f};       // Bright blue
+            else if(current_slot == s_odd)
+                leds_[i] = {0.4f, 0.0f, 0.8f};       // Bright purple
+            else if(has_even || has_odd)
+                leds_[i] = {has_odd ? 0.05f : 0.0f,
+                            0.0f, 0.12f};             // Dim blue/purple
+            else
+                leds_[i] = {0.0f, 0.0f, 0.0f};       // Empty
+        }
+    }
+
+    LedColor    leds_[4];
+    uint32_t    slot_display_timer_ = 0;
 };
