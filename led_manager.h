@@ -31,9 +31,20 @@ class LedManager
                 bool show_range, uint32_t range_start,
                 uint32_t range_end, uint32_t total_slices,
                 bool cyan_flash, uint32_t cyan_slice,
-                bool oneshot_waiting = false)
+                bool oneshot_waiting = false,
+                bool threshold_armed = false)
     {
-        (void)show_range;  // Range is ALWAYS applied during playback
+        (void)show_range;
+        // Cache normalized range for RenderArmed
+        if(total_slices > 0)
+        {
+            armed_ns_ = static_cast<float>(range_start)
+                      / static_cast<float>(total_slices);
+            armed_ne_ = static_cast<float>(range_end + 1)
+                      / static_cast<float>(total_slices);
+            if(armed_ne_ > 1.0f) armed_ne_ = 1.0f;
+            if(armed_ns_ >= armed_ne_) armed_ne_ = armed_ns_ + 0.01f;
+        }
         (void)cyan_flash;
         (void)cyan_slice;
 
@@ -72,7 +83,10 @@ class LedManager
 
             case RecordState::PLAYING:
                 if(oneshot_waiting)
-                    RenderOneshotWaiting(range_start, range_end, total_slices);
+                    RenderAllOff();  // Oneshot waiting: dark until triggered
+                else if(threshold_armed)
+                    RenderPlayback(progress, range_start, range_end,
+                                   total_slices, false, true);
                 else
                     RenderPlayback(progress, range_start, range_end,
                                    total_slices, false);
@@ -94,6 +108,7 @@ class LedManager
     }
 
     void ShowSlotDisplay(uint32_t ticks = 400) { slot_display_timer_ = ticks; }
+    bool IsSlotDisplayActive() const { return slot_display_timer_ > 0; }
 
     const LedColor& GetLed(uint32_t i) const
     {
@@ -120,29 +135,48 @@ class LedManager
 
     void RenderArmed()
     {
-        // Steady warm orange on all 4 LEDs
+        // Warm orange on in-range LEDs only, off on out-of-range.
+        // Uses cached range from last Update call.
         for(int i = 0; i < 4; i++)
-            leds_[i] = {0.3f, 0.08f, 0.0f};
+        {
+            float q_lo = static_cast<float>(i) * 0.25f;
+            float q_hi = q_lo + 0.25f;
+            if(q_lo < armed_ne_ && q_hi > armed_ns_)
+                leds_[i] = {0.3f, 0.08f, 0.0f};
+            else
+                leds_[i] = {0.0f, 0.0f, 0.0f};
+        }
     }
 
     void RenderRecording(float progress)
     {
-        // Red fill left→right matching record progress
+        // Red fill within the slice range only.
+        // Uses cached armed_ns_/armed_ne_ from Update().
         if(progress > 1.0f) progress = 1.0f;
+        // Map progress into the range
+        float fill_pos = armed_ns_ + progress * (armed_ne_ - armed_ns_);
+
         for(int i = 0; i < 4; i++)
         {
-            float q_start = static_cast<float>(i) * 0.25f;
-            float q_end   = q_start + 0.25f;
+            float q_lo = static_cast<float>(i) * 0.25f;
+            float q_hi = q_lo + 0.25f;
 
-            if(progress >= q_end)
-                leds_[i] = {0.6f, 0.0f, 0.0f};      // Filled
-            else if(progress >= q_start)
+            // Out of range: off
+            if(q_lo >= armed_ne_ || q_hi <= armed_ns_)
             {
-                float f = (progress - q_start) / 0.25f;
-                leds_[i] = {0.25f + f * 0.35f, 0.0f, 0.0f}; // Partial
+                leds_[i] = {0.0f, 0.0f, 0.0f};
+                continue;
+            }
+
+            if(fill_pos >= q_hi)
+                leds_[i] = {0.6f, 0.0f, 0.0f};      // Filled
+            else if(fill_pos > q_lo)
+            {
+                float f = (fill_pos - q_lo) / 0.25f;
+                leds_[i] = {0.25f + f * 0.35f, 0.0f, 0.0f};
             }
             else
-                leds_[i] = {0.0f, 0.0f, 0.0f};      // Not yet
+                leds_[i] = {0.08f, 0.0f, 0.0f};      // In range, not yet
         }
     }
 
@@ -156,7 +190,7 @@ class LedManager
      */
     void RenderPlayback(float progress, uint32_t range_start,
                         uint32_t range_end, uint32_t total_slices,
-                        bool overdub)
+                        bool overdub, bool threshold_armed = false)
     {
         if(total_slices == 0) { RenderAllOff(); return; }
 
@@ -176,11 +210,12 @@ class LedManager
 
         for(int i = 0; i < 4; i++)
         {
-            // Use quadrant midpoint for stable range decision
-            float q_mid = (static_cast<float>(i) + 0.5f) * 0.25f;
+            // Overlap test: does LED quadrant overlap the slice range?
+            float q_lo = static_cast<float>(i) * 0.25f;
+            float q_hi = q_lo + 0.25f;
 
-            // RANGE CHECK: outside range → completely off
-            if(q_mid < norm_s || q_mid >= norm_e)
+            // RANGE CHECK: no overlap -> completely off
+            if(q_lo >= norm_e || q_hi <= norm_s)
             {
                 leds_[i] = {0.0f, 0.0f, 0.0f};
                 continue;
@@ -190,17 +225,20 @@ class LedManager
             if(i == head_q)
             {
                 if(overdub)
-                    leds_[i] = {1.0f, 0.0f, 0.0f};   // Red
+                    leds_[i] = {1.0f, 0.0f, 0.0f};       // Red
+                else if(threshold_armed)
+                    leds_[i] = {0.8f, 0.5f, 0.0f};       // Yellow/amber
                 else
-                    leds_[i] = {0.0f, 1.0f, 0.0f};   // Green
+                    leds_[i] = {0.0f, 1.0f, 0.0f};       // Green
             }
             else
             {
-                // IN-RANGE BACKGROUND: dim steady
                 if(overdub)
-                    leds_[i] = {BG, 0.0f, 0.0f};     // Dim red
+                    leds_[i] = {BG, 0.0f, 0.0f};         // Dim red
+                else if(threshold_armed)
+                    leds_[i] = {BG, BG * 0.6f, 0.0f};    // Dim amber
                 else
-                    leds_[i] = {0.0f, BG, 0.0f};     // Dim green
+                    leds_[i] = {0.0f, BG, 0.0f};         // Dim green
             }
         }
     }
@@ -214,8 +252,9 @@ class LedManager
         if(ns >= ne) ne = ns + 0.01f;
         for(int i = 0; i < 4; i++)
         {
-            float qm = (static_cast<float>(i) + 0.5f) * 0.25f;
-            if(qm >= ns && qm < ne)
+            float q_lo = static_cast<float>(i) * 0.25f;
+            float q_hi = q_lo + 0.25f;
+            if(q_lo < ne && q_hi > ns)
                 leds_[i] = {0.0f, BG * 0.5f, BG};
             else
                 leds_[i] = {0.0f, 0.0f, 0.0f};
@@ -236,8 +275,9 @@ class LedManager
 
         for(int i = 0; i < 4; i++)
         {
-            float q_mid = (static_cast<float>(i) + 0.5f) * 0.25f;
-            if(q_mid >= norm_s && q_mid < norm_e)
+            float q_lo = static_cast<float>(i) * 0.25f;
+            float q_hi = q_lo + 0.25f;
+            if(q_lo < norm_e && q_hi > norm_s)
                 leds_[i] = {0.0f, BG, 0.0f};
             else
                 leds_[i] = {0.0f, 0.0f, 0.0f};
@@ -270,25 +310,27 @@ class LedManager
     void RenderSlotDisplay(uint32_t current_slot,
                            const RecordState* slot_states)
     {
+        (void)slot_states;
+        // Clean: ONLY the selected slot LED is lit, all others off.
+        // Slots 0-3 = purple, slots 4-7 = blue.
+        bool upper_bank = (current_slot >= 4);
+        uint32_t led_idx = current_slot & 3;  // 0-3 within bank
         for(int i = 0; i < 4; i++)
         {
-            uint32_t s_even = i * 2;
-            uint32_t s_odd  = i * 2 + 1;
-            bool has_even = (slot_states[s_even] != RecordState::EMPTY);
-            bool has_odd  = (slot_states[s_odd]  != RecordState::EMPTY);
-
-            if(current_slot == s_even)
-                leds_[i] = {0.0f, 0.0f, 0.8f};       // Bright blue
-            else if(current_slot == s_odd)
-                leds_[i] = {0.4f, 0.0f, 0.8f};       // Bright purple
-            else if(has_even || has_odd)
-                leds_[i] = {has_odd ? 0.05f : 0.0f,
-                            0.0f, 0.12f};             // Dim blue/purple
+            if(static_cast<uint32_t>(i) == led_idx)
+            {
+                if(upper_bank)
+                    leds_[i] = {0.0f, 0.0f, 0.9f};     // Bright blue
+                else
+                    leds_[i] = {0.5f, 0.0f, 0.9f};     // Bright purple
+            }
             else
-                leds_[i] = {0.0f, 0.0f, 0.0f};       // Empty
+                leds_[i] = {0.0f, 0.0f, 0.0f};
         }
     }
 
+    float       armed_ns_ = 0.0f;
+    float       armed_ne_ = 1.0f;
     LedColor    leds_[4];
     uint32_t    slot_display_timer_ = 0;
 };

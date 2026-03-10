@@ -1,19 +1,19 @@
 /**
- * THE HILLSIDE SLICER - Custom Versio Firmware
+ * THE HILLSIDE SLICER 0.7-alpha - Custom Versio Firmware
  *
  * Panel:
- *   1 / KNOB_0 (top-left)      : Start slice / [Settings: Bars 1-4]
- *   2 / KNOB_1 (bottom-left)   : Input Volume / [Settings: Merge DEST slot 1-8]
- *   3 / KNOB_2 (top-center)    : Speed / [Settings: BPM 40-200 in 5s]
- *   4 / KNOB_3 (bottom-center) : Pitch (-24/+12 semi) / [Settings: Merge SRC slot 1-8]
- *   5 / KNOB_4 (top-right)     : End slice / [Settings: Slices 4-64]
- *   6 / KNOB_5 (right-middle)  : Slice Gate
- *   7 / KNOB_6 (bottom-right)  : Slot select (1-8)
+ *   1 / KNOB_0 (top-left)      : Start Slice / [Config: Bars 1-4]
+ *   2 / KNOB_1 (bottom-left)   : Input Volume / [Config: Resample Mode]
+ *   3 / KNOB_2 (top-center)    : Speed (0.5x-2x) / [Config: BPM or Clock Div]
+ *   4 / KNOB_3 (bottom-center) : Audio Effect Knob / [Config: Audio Effect Select]
+ *   5 / KNOB_4 (top-right)     : Slice Length / [Config: Slices 4-32 per bar]
+ *   6 / KNOB_5 (right-middle)  : Play Effect Knob / [Config: Play Effect Select]
+ *   7 / KNOB_6 (bottom-right)  : Slot select (1-8) / [Config: unused]
  *
  *   ABC / SW_0 : Immediate / ClockSync / Threshold
  *   XYZ / SW_1 : Loop / OneShot / SETTINGS
  *   FSU / TAP  : Record / Stop / Hold=Clear
- *   GATE IN    : 24PPQN Clock In (bar-sync playback)
+ *   GATE IN    : Clock In (1 pulse per beat, bar-sync playback)
  *
  *   Volume knob (KNOB_1):
  *     Normal mode: Controls INCOMING signal level (monitoring + recording).
@@ -75,7 +75,9 @@ PlaybackEngine     playbackEngine;
 LedManager         ledManager;
 PersistenceManager persistManager;
 ClockTracker    clockTracker;
-PPQNClockDetector ppqnClock;
+
+// Audio effects now handled by spectral modes in grain_engine pitch shifter
+// Clock detection now uses direct gate edges (ext_clock_samples, ext_beat_count)
 
 // Active settings (what the engine uses)
 static RecordSettings active_settings;
@@ -89,17 +91,54 @@ static volatile bool save_slot0_pending = false;
 // ── Buffer Merge (config mode) ────────────────────────────────
 // Triple-tap confirmation to overdub one slot into another.
 // Knob 5 = destination slot, Knob 3 = source slot (in config mode).
+// ── Effect enums ──────────────────────────────────────────────
+enum class AudioEffect : uint8_t
+{
+    PITCH_SHIFT = 0,   // Spectral pitch shift (bin k → k×factor)
+    FREQ_SHIFT,        // Koszalin-style constant Hz shift
+    FORMANT_SHIFT,     // Shift spectral envelope (character change)
+    HARMONIC_SPREAD,   // Push/compress harmonics around fundamental
+    NUM_AUDIO_EFFECTS  // = 4
+};
+
+enum class PlayEffect : uint8_t
+{
+    CROSSFADER = 0,    // DJ battle crossfader (current)
+    SLICE_GATE,        // Per-slice amplitude gate (current)
+    SLICE_REPEAT,      // Each slice plays N times (stub)
+    LOOP_FADER,        // Fade out over entire range (stub)
+    SLICE_LPG,         // Buchla-style LPG per slice (stub)
+    NUM_PLAY_EFFECTS
+};
+
 enum class MergeState
 {
     IDLE,
-    CONFIRM_1,   // Dim solid red — tap again within 2s
-    CONFIRM_2,   // Bright solid red — tap again within 2s to execute
+    CONFIRM_1,
+    CONFIRM_2,
 };
 static MergeState  merge_state       = MergeState::IDLE;
+static uint32_t   tap_tempo_count   = 0;
+static uint32_t   tap_tempo_samples = 0;
+static uint32_t   tap_tempo_prev    = 0;
+static uint32_t   tap_tempo_timeout = 0;
 static uint32_t    merge_timeout     = 0;
-static uint32_t    merge_dest_slot   = 0;
-static uint32_t    merge_src_slot    = 0;
 static uint32_t    merge_done_timer  = 0;  // White flash after merge
+
+// Config knob snapshots: only apply if knob moved from entry position
+static float cfg_snap_k0 = 0.5f;  // Bars
+static float cfg_snap_k1 = 0.5f;  // Resample
+static float cfg_snap_k2 = 0.5f;  // BPM
+static float cfg_snap_k3 = 0.5f;  // Audio effect
+static float cfg_snap_k4 = 0.5f;  // Slices
+static float cfg_snap_k5 = 0.5f;  // Play effect
+static bool  cfg_moved_k0 = false;
+static bool  cfg_moved_k1 = false;
+static bool  cfg_moved_k2 = false;
+static bool  cfg_moved_k3 = false;
+static bool  cfg_moved_k4 = false;
+static bool  cfg_moved_k5 = false;
+static constexpr float CFG_MOVE_THRESH = 0.05f;
 
 static constexpr uint32_t MERGE_TIMEOUT_TICKS = 750;  // ~2s at 375 ticks/s
 
@@ -136,36 +175,65 @@ static CatchKnob ck_input_vol;
 
 // Output volume (set in config mode, applied at end of chain)
 static float output_volume = 1.0f;
+
+// Active effect selections (applied immediately, not staged)
+static AudioEffect active_audio_effect = AudioEffect::PITCH_SHIFT;
+static PlayEffect  active_play_effect  = PlayEffect::CROSSFADER;
+static AudioEffect config_audio_effect = AudioEffect::PITCH_SHIFT;
+static PlayEffect  config_play_effect  = PlayEffect::CROSSFADER;
+static uint32_t    effect_vis_timer    = 0;
+static uint32_t    effect_vis_id       = 0;  // Which effect changed
+static uint32_t startup_mute = 9600;  // 100ms silence at boot (96kHz)  // false=slice gate, true=crossfader
 static uint32_t frozen_slot = 0;
+static PlaybackMode frozen_play_mode = PlaybackMode::LOOP;
 
 // First-move-activates for speed/pitch during recording
 static bool  speed_frozen     = false;
 static bool  pitch_frozen     = false;
 static float speed_freeze_raw = 0.5f;
 static float pitch_freeze_raw = 0.5f;
+static bool  gate_frozen      = false;
+static bool  threshold_rearm = false;
+static bool     auto_overdub   = false;   // Threshold-triggered overdub: auto-stop on loop
+static uint32_t overdub_start_slice = 0;
+static uint32_t overdub_sample_count = 0;  // Slice where overdub started
+static uint32_t threshold_grace = 0;  // Grace period after arming  // Re-arm threshold while playing
+static float gate_freeze_raw  = 1.0f;
 
 // State
 static bool     tap_held          = false;
 static uint32_t tap_hold_counter  = 0;
 static uint32_t prev_slot         = 0;
+static float    prev_slot_knob    = 0.0f;
 static bool     was_recording     = false;
 static bool     in_settings_mode  = false;
 static PlaybackMode prev_play_mode = PlaybackMode::LOOP;
 static bool     prev_settings_mode = false;
+static uint32_t sw1_stable_frames  = 99;  // Frames since last switch change
+static PlaybackMode sw1_last_mode  = PlaybackMode::LOOP;
+static bool         sw1_last_settings = false;
 
 // Internal clock
 static uint32_t internal_clock_counter = 0;
-static bool     external_clock_active  = false;
+static bool     clock_mode_external    = false;  // User's choice (TAP hold toggle)
+static bool     external_clock_active  = false;  // Actually receiving edges
 static uint32_t ext_clock_timeout      = 0;
 
 // Gate
 static bool     prev_gate_state   = false;
 static uint32_t gate_flash_timer  = 0;
+static uint32_t ext_clock_samples = 0;  // Samples between clock edges
+static uint32_t last_clock_period = 0;  // Last measured period (for BPM display)
+static uint32_t ext_beat_count    = 0;  // Beats counted for bar sync
 
 // Knob vis
 static float    prev_knob_start  = -1.0f;
 static float    prev_knob_end    = -1.0f;
 static uint32_t knob_vis_timer   = 0;
+static float    prev_knob_gate   = -1.0f;
+static uint32_t xfade_vis_timer  = 0;
+static uint32_t resample_vis_timer = 0;
+static uint32_t resample_vis_passes = 0;
 
 // Settings flash
 // (settings flash removed — solid colors only)
@@ -181,8 +249,8 @@ static uint32_t config_hold_counter   = 0;
 static bool     config_reset_done     = false;
 
 static constexpr uint32_t HOLD_CLEAR_THRESHOLD   = 115200;  // 1.2s normal clear
-static constexpr uint32_t CONFIG_WARN_THRESHOLD  = 144000;  // 1.5s red flash
-static constexpr uint32_t CONFIG_RESET_THRESHOLD = 192000;  // 2.0s full reset
+static constexpr uint32_t CONFIG_WARN_THRESHOLD  = 72000;   // 0.75s blue ramp
+static constexpr uint32_t CONFIG_RESET_THRESHOLD = 115200;  // 1.2s toggle clock
 static constexpr uint32_t EXT_CLOCK_TIMEOUT      = 384000;
 static constexpr float    KNOB_CHANGE_THRESH     = 0.02f;
 static constexpr uint32_t KNOB_VIS_DURATION      = 300;
@@ -202,23 +270,50 @@ RecordMode GetRecordMode()
     }
 }
 
+/** Read SW_1 with debounce. Only updates in_settings_mode and
+ *  returns a new play_mode after the switch has been stable for
+ *  3+ frames. This prevents switch-travel through CENTER from
+ *  triggering ONESHOT when moving UP↔DOWN. */
 PlaybackMode ReadSW1()
 {
-    switch(hw.sw[DaisyVersio::SW_1].Read())
+    auto pos = hw.sw[DaisyVersio::SW_1].Read();
+
+    PlaybackMode new_mode;
+    bool new_settings;
+    switch(pos)
     {
         case Switch3::POS_UP:
-            in_settings_mode = false;
-            return PlaybackMode::LOOP;
+            new_settings = false; new_mode = PlaybackMode::LOOP; break;
         case Switch3::POS_CENTER:
-            in_settings_mode = false;
-            return PlaybackMode::ONESHOT;
+            new_settings = false; new_mode = PlaybackMode::ONESHOT; break;
         case Switch3::POS_DOWN:
-            in_settings_mode = true;
-            return PlaybackMode::LOOP;
+            new_settings = true;  new_mode = PlaybackMode::LOOP; break;
         default:
-            in_settings_mode = false;
-            return PlaybackMode::LOOP;
+            new_settings = false; new_mode = PlaybackMode::LOOP; break;
     }
+
+    // Track stability
+    if(new_mode != sw1_last_mode || new_settings != sw1_last_settings)
+    {
+        sw1_stable_frames = 0;
+        sw1_last_mode = new_mode;
+        sw1_last_settings = new_settings;
+    }
+    else if(sw1_stable_frames < 99)
+    {
+        sw1_stable_frames++;
+    }
+
+    // Only commit after 3 stable frames (~0.8ms at 256-sample blocks)
+    if(sw1_stable_frames >= 10)
+    {
+        in_settings_mode = new_settings;
+        return new_mode;
+    }
+
+    // During instability, keep previous state
+    in_settings_mode = prev_settings_mode;
+    return (prev_settings_mode) ? frozen_play_mode : prev_play_mode;
 }
 
 uint32_t KnobToSliceIndex(float value, uint32_t num_slices)
@@ -227,6 +322,17 @@ uint32_t KnobToSliceIndex(float value, uint32_t num_slices)
     uint32_t idx = static_cast<uint32_t>(value * static_cast<float>(num_slices));
     if(idx >= num_slices) idx = num_slices - 1;
     return idx;
+}
+
+/** Map 0.0-1.0 to slice length 1..num_slices.
+ *  Far left = 1 slice, far right = all slices. */
+uint32_t KnobToSliceLength(float value, uint32_t num_slices)
+{
+    if(num_slices == 0) return 1;
+    uint32_t len = 1 + static_cast<uint32_t>(value * static_cast<float>(num_slices - 1) + 0.5f);
+    if(len > num_slices) len = num_slices;
+    if(len < 1) len = 1;
+    return len;
 }
 
 uint32_t GetSlotFromKnob(float value)
@@ -239,6 +345,18 @@ uint32_t GetSlotFromKnob(float value)
     if(value < 0.735f) return 5;
     if(value < 0.860f) return 6;
     return 7;
+}
+
+/** Map KNOB_5 in config to resample_passes.
+ *  CCW=replace, middle=frippertronics 1-4, CW=unity */
+uint32_t KnobToResamplePasses(float value)
+{
+    if(value < 0.12f) return 0;       // Replace
+    if(value < 0.30f) return 1;       // 1-pass fripp
+    if(value < 0.48f) return 2;       // 2-pass
+    if(value < 0.66f) return 3;       // 3-pass
+    if(value < 0.84f) return 4;       // 4-pass
+    return 5;                          // Unity overdub
 }
 
 uint32_t KnobToBars(float value)
@@ -258,13 +376,37 @@ float KnobToBPM(float value)
     return snapped;
 }
 
-uint32_t KnobToSlices(float value)
+/** Map KNOB_4 to slices per bar: 4, 8, 16 (noon), 24, 32.
+ *  5 positions with dead zones. Noon default = 16. */
+uint32_t KnobToSlicesPerBar(float value)
 {
-    if(value < 0.20f) return 4;
-    if(value < 0.40f) return 8;
-    if(value < 0.60f) return 16;
-    if(value < 0.80f) return 32;
-    return 64;
+    if(value < 0.15f) return 4;
+    if(value < 0.35f) return 8;
+    if(value < 0.65f) return 16;   // Dead zone at noon
+    if(value < 0.85f) return 24;
+    return 32;
+}
+
+AudioEffect KnobToAudioEffect(float value)
+{
+    if(value < 0.20f) return AudioEffect::PITCH_SHIFT;
+    if(value < 0.45f) return AudioEffect::FREQ_SHIFT;
+    if(value < 0.70f) return AudioEffect::FORMANT_SHIFT;
+    return AudioEffect::HARMONIC_SPREAD;
+}
+
+PlayEffect KnobToPlayEffect(float value)
+{
+    if(value < 0.15f) return PlayEffect::CROSSFADER;
+    if(value < 0.35f) return PlayEffect::SLICE_GATE;
+    if(value < 0.55f) return PlayEffect::SLICE_REPEAT;
+    if(value < 0.75f) return PlayEffect::LOOP_FADER;
+    return PlayEffect::SLICE_LPG;
+}
+
+inline bool IsCrossfaderMode()
+{
+    return (active_play_effect == PlayEffect::CROSSFADER);
 }
 
 inline float HardLimit(float x)
@@ -292,15 +434,16 @@ void ApplyRecordDefaults()
     ck_end.Catch(raw_e);
     uint32_t ns = playbackEngine.GetNumSlices();
     if(ns == 0) ns = active_settings.slices;
-    uint32_t si = static_cast<uint32_t>(raw_s * (ns > 0 ? ns - 1 : 0));
-    uint32_t ei = static_cast<uint32_t>(raw_e * (ns > 0 ? ns - 1 : 0));
-    if(si >= ns) si = ns - 1;
+    uint32_t si = KnobToSliceIndex(raw_s, ns);
+    uint32_t len = KnobToSliceLength(raw_e, ns);
+    uint32_t ei = si + len - 1;
     if(ei >= ns) ei = ns - 1;
-    if(ei < si) ei = si;
     playbackEngine.SetStartSlice(si);
     playbackEngine.SetEndSlice(ei);
-    ck_gate.Set(1.0f);
-    playbackEngine.SetSliceGate(1.0f);
+    gate_frozen = true;
+    gate_freeze_raw = hw.GetKnobValue(DaisyVersio::KNOB_5);
+    ck_gate.Catch(0.5f);  // Crossfader noon default
+    playbackEngine.SetSliceGate(1.0f);  // Gate fully open during recording
 }
 
 /** Apply staged settings. If bars increased, extend the current
@@ -311,19 +454,24 @@ void CommitStagedSettings()
     active_settings = staged_settings;
     sliceEngine.SetSettings(active_settings);
 
-    // If bars changed and there's an active recording, extend/truncate
+    bool changed = false;
     if(active_settings.bars != old.bars)
     {
         sliceEngine.ExtendToBarCount(active_settings.bars, old.bars);
-        playbackEngine.ResyncSlices();
+        changed = true;
     }
-
-    // Re-slice with new slice count
     if(active_settings.slices != old.slices)
     {
         sliceEngine.ResliceCurrentSlot();
-        playbackEngine.ResyncSlices();
+        changed = true;
     }
+    if(changed)
+        playbackEngine.ResyncSlices();
+
+    // BPM change on existing buffer: scale the internal clock period.
+    // This effectively speeds up or slows down playback to match.
+    // The buffer samples don't change — just the rate we iterate.
+    // (No reslice needed — slice boundaries are sample-based.)
 }
 
 /** Full module reset: clear all slots, reset config to defaults */
@@ -342,9 +490,20 @@ void FullModuleReset()
     active_settings.bars   = 1;
     active_settings.slices = 16;
     active_settings.bpm    = 120.0f;
-    active_settings.overdub_feedback = 1.0f;
+    active_settings.overdub_feedback = 0.0f;
+    active_settings.resample_passes = 0;  // Default: replace
+    active_settings.audio_effect = 0;
+    active_settings.play_effect  = 0;
     staged_settings = active_settings;
     sliceEngine.SetSettings(active_settings);
+
+    clock_mode_external = false;
+    external_clock_active = false;
+    active_audio_effect = AudioEffect::PITCH_SHIFT;
+    // Effects stripped — pitch shifter only
+    active_play_effect  = PlayEffect::CROSSFADER;
+    config_audio_effect = AudioEffect::PITCH_SHIFT;
+    config_play_effect  = PlayEffect::CROSSFADER;
 
     prev_staged_bars   = 1;
     prev_staged_slices = 16;
@@ -383,64 +542,89 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     }
     else
     {
-        // Frozen in config mode
+        // Config mode: input volume frozen at last play-mode value
         input_vol = (ck_input_vol.target < 0.02f) ? 0.0f
                     : ck_input_vol.target * ck_input_vol.target;
-
-        // KNOB_1 controls output volume in real time (squared taper)
-        float ov = (knob_1_raw < 0.02f) ? 0.0f
-                   : knob_1_raw * knob_1_raw;
-        output_volume = ov;
     }
 
     // ── Mode switch ────────────────────────────────────────
+    // Read switch FIRST, but don't act on play_mode transitions
+    // until we've handled the settings mode transition.
     PlaybackMode play_mode = ReadSW1();
+
+    // Detect settings transition BEFORE processing play mode
+    bool entering_settings = (in_settings_mode && !prev_settings_mode);
+    bool leaving_settings  = (!in_settings_mode && prev_settings_mode);
+
+    // Override play_mode while in settings to prevent switch-travel damage
+    if(in_settings_mode || entering_settings)
+        play_mode = frozen_play_mode;
+
     playbackEngine.SetPlayMode(play_mode);
-    if(play_mode == PlaybackMode::ONESHOT && prev_play_mode == PlaybackMode::LOOP)
+
+    // Only process play_mode transitions when NOT entering/leaving settings
+    if(!in_settings_mode && !leaving_settings)
     {
-        if(playbackEngine.IsPlaying() && !playbackEngine.IsOneshotDone())
-            playbackEngine.SetOneshotDone();
+        if(play_mode == PlaybackMode::ONESHOT && prev_play_mode == PlaybackMode::LOOP)
+        {
+            if(playbackEngine.IsPlaying() && !playbackEngine.IsOneshotDone())
+                playbackEngine.SetOneshotDone();
+        }
+        if(play_mode == PlaybackMode::LOOP && prev_play_mode == PlaybackMode::ONESHOT)
+        {
+            if(playbackEngine.IsPlaying() && playbackEngine.IsOneshotDone())
+                playbackEngine.StartPlayback();
+        }
+        prev_play_mode = play_mode;
     }
-    if(play_mode == PlaybackMode::LOOP && prev_play_mode == PlaybackMode::ONESHOT)
-    {
-        if(playbackEngine.IsPlaying() && playbackEngine.IsOneshotDone())
-            playbackEngine.StartPlayback();  // Resume looping
-    }
-    prev_play_mode = play_mode;
 
     // ── Mode transitions ───────────────────────────────────
-    if(in_settings_mode != prev_settings_mode)
+    if(entering_settings)
     {
-        if(in_settings_mode)
-        {
-            // Entering settings: snapshot current active → staged
-            staged_settings = active_settings;
-            prev_staged_bars   = staged_settings.bars;
-            prev_staged_bpm    = staged_settings.bpm;
-            prev_staged_slices = staged_settings.slices;
-            config_tap_held     = false;
-            config_hold_counter = 0;
-            config_reset_done   = false;
-            // Freeze slot so it can't change from knob jitter
-            frozen_slot = sliceEngine.GetCurrentSlot();
-        }
-        else
-        {
-            // Leaving settings: commit staged changes
-            CommitStagedSettings();
+        staged_settings = active_settings;
+        prev_staged_bars   = staged_settings.bars;
+        prev_staged_bpm    = staged_settings.bpm;
+        prev_staged_slices = staged_settings.slices;
+        config_tap_held     = false;
+        config_hold_counter = 0;
+        config_reset_done   = false;
+        frozen_slot = sliceEngine.GetCurrentSlot();
+        frozen_play_mode = prev_play_mode;
+        config_audio_effect = active_audio_effect;
+        config_play_effect  = active_play_effect;
 
-            // Restore slot — knob_6 may have drifted during config
-            sliceEngine.SetCurrentSlot(frozen_slot);
-            prev_slot = frozen_slot;
+        // Snapshot knob positions — only apply settings if moved
+        cfg_snap_k0 = hw.GetKnobValue(DaisyVersio::KNOB_0);
+        cfg_snap_k1 = hw.GetKnobValue(DaisyVersio::KNOB_1);
+        cfg_snap_k2 = hw.GetKnobValue(DaisyVersio::KNOB_2);
+        cfg_snap_k3 = hw.GetKnobValue(DaisyVersio::KNOB_3);
+        cfg_snap_k4 = hw.GetKnobValue(DaisyVersio::KNOB_4);
+        cfg_snap_k5 = hw.GetKnobValue(DaisyVersio::KNOB_5);
+        cfg_moved_k0 = cfg_moved_k1 = cfg_moved_k2 = false;
+        cfg_moved_k3 = cfg_moved_k4 = cfg_moved_k5 = false;
 
-            // Shared knobs need catch-up (were repurposed in settings)
-            ck_start.Set(ck_start.target);
-            ck_speed.Set(ck_speed.target);
-            ck_end.Set(ck_end.target);
-            ck_pitch.Set(ck_pitch.target);  // Was merge source selector
-            ck_gate.Set(ck_gate.target);    // Was overdub feedback selector
-            ck_input_vol.Set(ck_input_vol.target);  // Was output vol
-        }
+        // Playback should continue uninterrupted. No restart needed
+        // since ReadSW1 now debounces through CENTER.
+    }
+    else if(leaving_settings)
+    {
+        CommitStagedSettings();
+
+        // Apply effect selections on exit
+        active_audio_effect = config_audio_effect;
+        active_play_effect  = config_play_effect;
+
+        sliceEngine.SetCurrentSlot(frozen_slot);
+        prev_slot = frozen_slot;
+        prev_slot_knob = hw.GetKnobValue(DaisyVersio::KNOB_6);
+
+        // Restore catch-up knobs to saved positions
+        ck_start.Set(ck_start.target);
+        ck_end.Set(ck_end.target);
+        ck_speed.Set(ck_speed.target);
+        ck_pitch.Set(ck_pitch.target);
+        ck_gate.Set(ck_gate.target);
+        ck_input_vol.Set(ck_input_vol.target);
     }
     prev_settings_mode = in_settings_mode;
 
@@ -468,7 +652,10 @@ void AudioCallback(AudioHandle::InputBuffer  in,
             if(knob_3_raw-pitch_freeze_raw>0.03f||pitch_freeze_raw-knob_3_raw>0.03f){pitch_frozen=false;ck_pitch.Catch(knob_3_raw);}
             eff_pitch=pitch_frozen?0.50f:knob_3_raw;
         } else { eff_pitch=ck_pitch.Update(knob_3_raw); }
-        eff_gate = ck_gate.Update(knob_5_raw);
+        if(gate_frozen) {
+            if(knob_5_raw-gate_freeze_raw>0.03f||gate_freeze_raw-knob_5_raw>0.03f){gate_frozen=false;ck_gate.Catch(knob_5_raw);}
+            eff_gate=gate_frozen?0.5f:knob_5_raw;
+        } else { eff_gate=ck_gate.Update(knob_5_raw); }
     }
     else
     {
@@ -476,46 +663,97 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         eff_pitch = ck_pitch.target;
         eff_gate  = ck_gate.target;
 
-        // Knob 1 (bottom-left) = merge destination slot (0-7)
-        // Knob 3 (bottom-center) = merge source slot (0-7)
-        merge_dest_slot = static_cast<uint32_t>(knob_1_raw * 7.99f);
-        if(merge_dest_slot > 7) merge_dest_slot = 7;
-        merge_src_slot  = static_cast<uint32_t>(knob_3_raw * 7.99f);
-        if(merge_src_slot > 7) merge_src_slot = 7;
+        // KNOB_1 (bottom-left) = Resample mode
+        if(cfg_moved_k1)
+        {
+            uint32_t new_passes = KnobToResamplePasses(knob_1_raw);
+            staged_settings.resample_passes = new_passes;
+            staged_settings.overdub_feedback = staged_settings.ComputeFeedback();
 
-        // Knob 5 (right-middle) = overdub feedback
-        // Left = 1.0 (pure overdub/sum), Right = 0.0 (full replace)
-        float overdub_fb = 1.0f - knob_5_raw;
-        staged_settings.overdub_feedback = overdub_fb;
+            static float prev_knob1_config = -1.0f;
+            if(fabsf(knob_1_raw - prev_knob1_config) > 0.02f)
+            {
+                resample_vis_timer = KNOB_VIS_DURATION;
+                resample_vis_passes = new_passes;
+                prev_knob1_config = knob_1_raw;
+            }
+        }
+        if(resample_vis_timer > 0) resample_vis_timer--;
+
+        // KNOB_3 (bottom-center) = Audio effect selector
+        if(!cfg_moved_k3 && fabsf(knob_3_raw - cfg_snap_k3) > CFG_MOVE_THRESH)
+            cfg_moved_k3 = true;
+        if(cfg_moved_k3)
+        {
+            AudioEffect new_ae = KnobToAudioEffect(knob_3_raw);
+            if(new_ae != config_audio_effect)
+            {
+                config_audio_effect = new_ae;
+                effect_vis_timer = KNOB_VIS_DURATION;
+                effect_vis_id = 3;
+            }
+        }
+
+        // KNOB_5 (right-middle) = Play effect selector
+        if(!cfg_moved_k5 && fabsf(knob_5_raw - cfg_snap_k5) > CFG_MOVE_THRESH)
+            cfg_moved_k5 = true;
+        if(cfg_moved_k5)
+        {
+            PlayEffect new_pe = KnobToPlayEffect(knob_5_raw);
+            if(new_pe != config_play_effect)
+            {
+                config_play_effect = new_pe;
+                effect_vis_timer = KNOB_VIS_DURATION;
+                effect_vis_id = 5;
+            }
+        }
+
+        if(effect_vis_timer > 0) effect_vis_timer--;
     }
 
     // ── Settings mode: edit staged values (NOT live) ───────
     if(in_settings_mode)
     {
-        uint32_t new_bars   = KnobToBars(knob_0_raw);
+        // Check which knobs have moved from snapshot
+        if(!cfg_moved_k0 && fabsf(knob_0_raw - cfg_snap_k0) > CFG_MOVE_THRESH)
+            cfg_moved_k0 = true;
+        if(!cfg_moved_k2 && fabsf(knob_2_raw - cfg_snap_k2) > CFG_MOVE_THRESH)
+            cfg_moved_k2 = true;
+        if(!cfg_moved_k4 && fabsf(knob_4_raw - cfg_snap_k4) > CFG_MOVE_THRESH)
+            cfg_moved_k4 = true;
+        if(!cfg_moved_k1 && fabsf(knob_1_raw - cfg_snap_k1) > CFG_MOVE_THRESH)
+            cfg_moved_k1 = true;
+
+        // Only update settings for knobs that actually moved
+        uint32_t new_bars   = cfg_moved_k0 ? KnobToBars(knob_0_raw)
+                                            : staged_settings.bars;
         float new_bpm;
-        if(ppqnClock.has_clock)
+        if(cfg_moved_k2)
         {
-            uint32_t ds = static_cast<uint32_t>(knob_2_raw * 3.99f);
-            static constexpr uint32_t dtbl[] = {1, 2, 4, 8};
-            ppqnClock.divider = dtbl[ds > 3 ? 3 : ds];
-            new_bpm = ppqnClock.GetEffBPM();
+            if(clock_mode_external && last_clock_period > 0)
+            {
+                uint32_t ds = static_cast<uint32_t>(knob_2_raw * 3.99f);
+                static constexpr uint32_t dtbl[] = {1, 2, 4, 8};
+                uint32_t div = dtbl[ds > 3 ? 3 : ds];
+                float raw_bpm = (96000.0f * 60.0f) / static_cast<float>(last_clock_period);
+                new_bpm = raw_bpm / static_cast<float>(div);
+            }
+            else
+                new_bpm = KnobToBPM(knob_2_raw);
         }
         else
-            new_bpm = KnobToBPM(knob_2_raw);
-        uint32_t new_slices = KnobToSlices(knob_4_raw);
+            new_bpm = staged_settings.bpm;
 
-        // Detect parameter changes → trigger magenta flash
+        uint32_t new_slices = cfg_moved_k4 ? KnobToSlicesPerBar(knob_4_raw)
+                                            : staged_settings.slices;
+
+        // Detect parameter changes → flash all 4 LEDs magenta
         if(new_bars != prev_staged_bars
            || new_slices != prev_staged_slices
            || fabsf(new_bpm - prev_staged_bpm) > 1.0f)
         {
-            config_param_flash = 200;  // ~200 callbacks ≈ 0.5s
-
-            // Which LED changed?
-            if(new_bars != prev_staged_bars)         config_flash_led = 0;
-            else if(fabsf(new_bpm - prev_staged_bpm) > 1.0f) config_flash_led = 1;
-            else                                     config_flash_led = 2;
+            config_param_flash = 200;
+            config_flash_led = 0;  // All 4 magenta
         }
 
         prev_staged_bars   = new_bars;
@@ -525,7 +763,6 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         staged_settings.bars   = new_bars;
         staged_settings.bpm    = new_bpm;
         staged_settings.slices = new_slices;
-        // NOT applied to engine — staged only!
     }
 
     // ── Playback params ────────────────────────────────────
@@ -538,8 +775,10 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     if(!in_settings_mode)
     {
         start_idx = KnobToSliceIndex(eff_start, num_slices);
-        end_idx   = KnobToSliceIndex(eff_end, num_slices);
-        if(end_idx < start_idx) end_idx = start_idx;
+        // End knob = slice length (1..num_slices from start)
+        uint32_t length = KnobToSliceLength(eff_end, num_slices);
+        end_idx = start_idx + length - 1;
+        if(end_idx >= num_slices) end_idx = num_slices - 1;
 
         playbackEngine.SetStartSlice(start_idx);
         playbackEngine.SetEndSlice(end_idx);
@@ -547,7 +786,19 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     }
 
     playbackEngine.SetPitch(eff_pitch);
-    playbackEngine.SetSliceGate(eff_gate);
+    // Play effect routing
+    switch(active_play_effect)
+    {
+        case PlayEffect::CROSSFADER:
+            playbackEngine.SetSliceGate(1.0f);  // Gate disabled
+            break;
+        case PlayEffect::SLICE_GATE:
+            playbackEngine.SetSliceGate(eff_gate);
+            break;
+        default:
+            playbackEngine.SetSliceGate(1.0f);  // Stubs: gate open
+            break;
+    }
 
     // ── Knob vis ───────────────────────────────────────────
     if(!in_settings_mode)
@@ -564,17 +815,37 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         prev_knob_start = knob_0_raw;
         prev_knob_end   = knob_4_raw;
         if(knob_vis_timer > 0) knob_vis_timer--;
+
+        // Crossfader position vis: compare against last TRIGGER position,
+        // not previous block. This catches continuous knob movement.
+        if(IsCrossfaderMode() &&
+           fabsf(knob_5_raw - prev_knob_gate) > 0.01f)
+        {
+            xfade_vis_timer = KNOB_VIS_DURATION;
+            prev_knob_gate = knob_5_raw;  // Only update at trigger
+        }
+        if(xfade_vis_timer > 0) xfade_vis_timer--;
     }
 
     // ── Slot ───────────────────────────────────────────────
-    if(!in_settings_mode)
+    if(in_settings_mode)
     {
-        uint32_t new_slot = GetSlotFromKnob(knob_6_raw);
-        if(new_slot != prev_slot)
+        // KNOB_6 in settings: freed (was crossfader/gate, now in play effect)
+    }
+    else
+    {
+        // Hysteresis: only switch if knob moved >3% from last switch point
+        if(fabsf(knob_6_raw - prev_slot_knob) > 0.06f)
         {
-            sliceEngine.SetCurrentSlot(new_slot);
-            ledManager.ShowSlotDisplay();
-            prev_slot = new_slot;
+            uint32_t new_slot = GetSlotFromKnob(knob_6_raw);
+            if(new_slot != prev_slot)
+            {
+                sliceEngine.SetCurrentSlot(new_slot);
+                threshold_rearm = false;
+                ledManager.ShowSlotDisplay();
+                prev_slot = new_slot;
+                prev_slot_knob = knob_6_raw;
+            }
         }
     }
 
@@ -596,12 +867,12 @@ void AudioCallback(AudioHandle::InputBuffer  in,
             }
             config_hold_counter += size;
 
+            // Hold 2s = toggle internal/external clock
             if(!config_reset_done &&
                config_hold_counter >= CONFIG_RESET_THRESHOLD)
             {
-                FullModuleReset();
-                merge_state = MergeState::IDLE;
-                config_reset_done = true;
+                clock_mode_external = !clock_mode_external;
+                config_reset_done = true;  // Only toggle once per hold
             }
         }
         else if(config_tap_held)
@@ -609,39 +880,39 @@ void AudioCallback(AudioHandle::InputBuffer  in,
             // Button released in config mode
             config_tap_held = false;
 
-            // Short tap (not a hold)?
+            // Short tap: tap tempo (3 taps sets BPM)
             if(config_hold_counter < CONFIG_WARN_THRESHOLD && !config_reset_done)
             {
-                // Advance merge confirmation state
-                switch(merge_state)
+                // Blue flash on all 4 LEDs for each tap
+                config_param_flash = 80;
+                config_flash_led = 99;  // Special: all-blue tap tempo
+
+                tap_tempo_count++;
+                if(tap_tempo_count == 1)
                 {
-                    case MergeState::IDLE:
-                        // Validate: source must have content, can't merge to self
-                        if(merge_dest_slot != merge_src_slot &&
-                           sliceEngine.GetSlotState(merge_src_slot) == RecordState::PLAYING)
+                    tap_tempo_samples = 0;
+                    tap_tempo_timeout = 96000;  // 1s timeout
+                }
+                else if(tap_tempo_count == 2)
+                {
+                    tap_tempo_prev = tap_tempo_samples;
+                    tap_tempo_samples = 0;
+                    tap_tempo_timeout = 96000;
+                }
+                else if(tap_tempo_count >= 3)
+                {
+                    // Average the two intervals
+                    uint32_t avg = (tap_tempo_prev + tap_tempo_samples) / 2;
+                    if(avg > 0)
+                    {
+                        float new_bpm = (96000.0f * 60.0f) / static_cast<float>(avg);
+                        if(new_bpm >= 40.0f && new_bpm <= 200.0f)
                         {
-                            merge_state   = MergeState::CONFIRM_1;
-                            merge_timeout = MERGE_TIMEOUT_TICKS;
+                            staged_settings.bpm = new_bpm;
+                            prev_staged_bpm = new_bpm;
                         }
-                        break;
-
-                    case MergeState::CONFIRM_1:
-                        merge_state   = MergeState::CONFIRM_2;
-                        merge_timeout = MERGE_TIMEOUT_TICKS;
-                        break;
-
-                    case MergeState::CONFIRM_2:
-                        // EXECUTE MERGE
-                        sliceEngine.MergeSlots(merge_dest_slot, merge_src_slot);
-                        // If we merged into the current slot, resync playback
-                        if(merge_dest_slot == sliceEngine.GetCurrentSlot())
-                            playbackEngine.ResyncSlices();
-                        merge_done_timer = 300;  // White flash ~0.8s
-                        merge_state = MergeState::IDLE;
-                        // Trigger save if destination is slot 0
-                        if(merge_dest_slot == 0)
-                            save_slot0_pending = true;
-                        break;
+                    }
+                    tap_tempo_count = 0;
                 }
             }
             config_hold_counter = 0;
@@ -691,6 +962,7 @@ void AudioCallback(AudioHandle::InputBuffer  in,
                 {
                     // Stop recording → finalize → play
                     sliceEngine.StopRecording();
+                    playbackEngine.ResetPitchShifters();
                     playbackEngine.StartPlayback();
 
                     // Release all catch-up knobs so they respond
@@ -703,6 +975,8 @@ void AudioCallback(AudioHandle::InputBuffer  in,
                     ck_gate.Catch(ck_gate.target);
                     speed_frozen = false;
                     pitch_frozen = false;
+                    gate_frozen = false;
+                    threshold_rearm = false;
                 }
                 else if(st == RecordState::PLAYING)
                 {
@@ -711,8 +985,41 @@ void AudioCallback(AudioHandle::InputBuffer  in,
                     {
                         playbackEngine.StartPlayback();
                     }
+                    else if(GetRecordMode() == RecordMode::THRESHOLD)
+                    {
+                        // Threshold: arm for re-record while still playing.
+                        // Don't call ArmRecording (destroys header/stops playback).
+                        // Just set flag; audio callback checks threshold while playing.
+                        threshold_rearm = !threshold_rearm;
+                        threshold_grace = 9600;
+                    }
+                    else if(GetRecordMode() == RecordMode::IMMEDIATE)
+                    {
+                        // Instant mode with content: use resample mode
+                        if(active_settings.resample_passes == 0)
+                        {
+                            // Replace: stop, clear, re-record
+                            playbackEngine.StopPlayback();
+                            {
+                                uint32_t ns = active_settings.slices;
+                                uint32_t si = KnobToSliceIndex(eff_start, ns);
+                                uint32_t len = KnobToSliceLength(eff_end, ns);
+                                uint32_t ei = si + len - 1;
+                                if(ei >= ns) ei = ns - 1;
+                                sliceEngine.SetRecordRange(si, ei);
+                            }
+                            sliceEngine.ArmRecording(RecordMode::IMMEDIATE);
+                            ApplyRecordDefaults();
+                        }
+                        else
+                        {
+                            // Frippertronics or unity: overdub
+                            sliceEngine.StartOverdub();
+                        }
+                    }
                     else
                     {
+                        // Clock-sync: normal overdub
                         sliceEngine.StartOverdub();
                     }
                 }
@@ -720,6 +1027,7 @@ void AudioCallback(AudioHandle::InputBuffer  in,
                 {
                     // Stop overdubbing → back to normal playback
                     sliceEngine.StopOverdub();
+                    auto_overdub = false;
                     // Trigger save if slot 0
                     if(sliceEngine.GetCurrentSlot() == 0)
                         save_slot0_pending = true;
@@ -729,14 +1037,30 @@ void AudioCallback(AudioHandle::InputBuffer  in,
                 {
                     // Empty/stopped → arm new recording
                     playbackEngine.StopPlayback();
+                    {
+                        uint32_t ns = active_settings.slices;
+                        uint32_t si = KnobToSliceIndex(eff_start, ns);
+                        uint32_t len = KnobToSliceLength(eff_end, ns);
+                        uint32_t ei = si + len - 1;
+                        if(ei >= ns) ei = ns - 1;
+                        sliceEngine.SetRecordRange(si, ei);
+                    }
                     sliceEngine.ArmRecording(GetRecordMode());
                     ApplyRecordDefaults();
                 }
-                else
+                else if(st == RecordState::ARMED)
                 {
-                    // ARMED → just re-arm (already armed)
-                    sliceEngine.ArmRecording(GetRecordMode());
-                    ApplyRecordDefaults();
+                    // ARMED -> cancel, go back to previous state
+                    const SlotHeader& hdr = sliceEngine.GetHeader();
+                    if(hdr.has_content && hdr.total_samples > 0)
+                    {
+                        sliceEngine.CancelArm();
+                        playbackEngine.StartPlayback();
+                    }
+                    else
+                    {
+                        sliceEngine.CancelArm();
+                    }
                 }
             }
         }
@@ -750,6 +1074,7 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     RecordState current_state = sliceEngine.GetState();
     if(was_recording && current_state == RecordState::PLAYING)
     {
+        playbackEngine.ResetPitchShifters();
         playbackEngine.StartPlayback();
 
         // Release ALL catch-up knobs so they respond immediately.
@@ -762,6 +1087,8 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         ck_gate.Catch(ck_gate.target);
         speed_frozen = false;
         pitch_frozen = false;
+        gate_frozen = false;
+        threshold_rearm = false;
 
         // Trigger save if slot 0 just finished recording
         if(sliceEngine.GetCurrentSlot() == 0)
@@ -795,10 +1122,18 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         if(gate_flash_timer > 0)
             gate_flash_timer--;
 
-        // == Route gate (24PPQN clock on Gate jack) ====
-        ppqnClock.bar_length = active_settings.bars * 4;
-        ppqnClock.Process(gate_rising);
-
+        // == Route gate: each rising edge = 1 clock tick ==
+        // Works with any Eurorack clock rate (1PPQN, 4PPQN, etc.)
+        // Track samples between edges globally for BPM display
+        uint32_t last_edge_period = ext_clock_samples;
+        if(gate_rising)
+        {
+            if(ext_clock_samples > 100)
+                last_clock_period = ext_clock_samples;
+            ext_clock_samples = 0;
+        }
+        else
+            ext_clock_samples++;
         RecordState st_now = sliceEngine.GetState();
 
         if(st_now == RecordState::ARMED || st_now == RecordState::RECORDING)
@@ -806,28 +1141,29 @@ void AudioCallback(AudioHandle::InputBuffer  in,
             bool got_tick = false;
             uint32_t tick_period = int_clock_period;
 
-            if(ppqnClock.beat_tick)
+            if(clock_mode_external && gate_rising)
             {
                 got_tick = true;
-                tick_period = ppqnClock.GetBeatPeriod();
-                if(tick_period == 0) tick_period = int_clock_period;
+                tick_period = last_edge_period > 100 ? last_edge_period : int_clock_period;
                 external_clock_active = true;
                 ext_clock_timeout = 0;
             }
+            else if(!clock_mode_external)
+            {
+                // Internal clock mode
+                internal_clock_counter++;
+                if(internal_clock_counter >= int_clock_period)
+                {
+                    internal_clock_counter = 0;
+                    got_tick = true;
+                }
+            }
             else
             {
+                // External mode but no edge this sample
                 ext_clock_timeout++;
                 if(ext_clock_timeout >= EXT_CLOCK_TIMEOUT)
                     external_clock_active = false;
-                if(!external_clock_active)
-                {
-                    internal_clock_counter++;
-                    if(internal_clock_counter >= int_clock_period)
-                    {
-                        internal_clock_counter = 0;
-                        got_tick = true;
-                    }
-                }
             }
 
             if(got_tick)
@@ -836,54 +1172,74 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         else if(st_now == RecordState::PLAYING ||
                 st_now == RecordState::OVERDUBBING)
         {
-            // Bar tick resets playhead in loop mode (keeps slicer synced)
-            if(ppqnClock.has_clock && ppqnClock.bar_tick
-               && play_mode == PlaybackMode::LOOP)
+            // During playback: track clock edges for BPM display only.
+            if(clock_mode_external && gate_rising)
             {
-                playbackEngine.ResetPlayhead();
                 external_clock_active = true;
                 ext_clock_timeout = 0;
             }
 
-            if(!ppqnClock.has_clock)
-            {
-                internal_clock_counter++;
-                if(internal_clock_counter >= int_clock_period)
-                    internal_clock_counter = 0;
-            }
+            // Internal clock always runs during playback for timing
+            internal_clock_counter++;
+            if(internal_clock_counter >= int_clock_period)
+                internal_clock_counter = 0;
         }
         else if(st_now == RecordState::STOPPED)
         {
-            // Clock starts while stopped with content: auto-start loop
-            if(ppqnClock.beat_tick && play_mode == PlaybackMode::LOOP)
+            if(clock_mode_external && gate_rising && play_mode == PlaybackMode::LOOP)
             {
                 const SlotHeader& hdr = sliceEngine.GetHeader();
                 if(hdr.num_slices > 0 && hdr.total_samples > 0)
                 {
                     playbackEngine.StartPlayback();
-                    ppqnClock.ResetBar();
                     external_clock_active = true;
                     ext_clock_timeout = 0;
+                    ext_beat_count = 0;
                 }
             }
         }
         else
         {
-            if(ppqnClock.has_clock)
+            if(clock_mode_external && gate_rising)
             { external_clock_active = true; ext_clock_timeout = 0; }
-            else
-            {
-                ext_clock_timeout++;
-                if(ext_clock_timeout >= EXT_CLOCK_TIMEOUT)
-                    external_clock_active = false;
-            }
         }
+        // ── Tap tempo counter (runs during config) ───
+        if(tap_tempo_count > 0 && tap_tempo_count < 3)
+        {
+            tap_tempo_samples++;
+            if(tap_tempo_timeout > 0)
+                tap_tempo_timeout--;
+            else
+                tap_tempo_count = 0;  // Timed out, reset
+        }
+
         // ── Threshold ──────────────────────────────────
         if(sliceEngine.GetState() == RecordState::ARMED &&
            GetRecordMode() == RecordMode::THRESHOLD)
         {
-            if(sliceEngine.CheckThreshold(in_l, in_r))
+            if(threshold_grace > 0)
+                threshold_grace--;
+            else if(sliceEngine.CheckThreshold(in_l, in_r))
+            {
                 sliceEngine.OnThresholdExceeded();
+                internal_clock_counter = 0;
+            }
+        }
+
+        // ── Threshold re-arm while playing ─────────────
+        if(threshold_rearm
+           && sliceEngine.GetState() == RecordState::PLAYING)
+        {
+            if(threshold_grace > 0)
+                threshold_grace--;
+            else if(sliceEngine.CheckThreshold(in_l, in_r))
+            {
+                threshold_rearm = false;
+                sliceEngine.StartOverdub();
+                auto_overdub = true;
+                overdub_sample_count = 0;
+                overdub_start_slice = playbackEngine.GetCurrentSlice();
+            }
         }
 
         // ── Recording ──────────────────────────────────
@@ -914,22 +1270,87 @@ void AudioCallback(AudioHandle::InputBuffer  in,
                                           active_settings.overdub_feedback);
             }
 
-            // Always sum input + playback.
-            // The Versio has no hardware bypass — if we don't output
-            // the input signal, it's gone. Player needs to hear both
-            // the loop AND their live input to jam/perform.
-            mix_l = HardLimit(in_l + play_l);
-            mix_r = HardLimit(in_r + play_r);
+            // Auto-stop threshold overdub after one full loop
+            if(auto_overdub && current == RecordState::OVERDUBBING)
+            {
+                overdub_sample_count++;
+                if(overdub_sample_count > 4096)
+                {
+                    uint32_t cur_sl = playbackEngine.GetCurrentSlice();
+                    if(cur_sl == overdub_start_slice
+                       && playbackEngine.GetSliceProgress() < 0.1f)
+                    {
+                        sliceEngine.StopOverdub();
+                        auto_overdub = false;
+                        overdub_sample_count = 0;
+                        if(sliceEngine.GetCurrentSlot() == 0)
+                            save_slot0_pending = true;
+                    }
+                }
+            }
+
+            // Audio effect post-processing (non-pitch effects)
+            // All audio effects handled inside grain engine spectral processor
+
+            // Apply play effect to output mixing
+            switch(active_play_effect)
+            {
+                case PlayEffect::CROSSFADER:
+                {
+                    float pos = eff_gate;
+                    if(pos < 0.05f) pos = 0.0f;
+                    if(pos > 0.95f) pos = 1.0f;
+                    float gain_a, gain_b;
+                    if(pos <= 0.5f) {
+                        gain_a = 1.0f;
+                        gain_b = pos * 2.0f;
+                    } else {
+                        gain_a = (1.0f - pos) * 2.0f;
+                        gain_b = 1.0f;
+                    }
+                    mix_l = HardLimit(in_l * gain_a + play_l * gain_b);
+                    mix_r = HardLimit(in_r * gain_a + play_r * gain_b);
+                    break;
+                }
+                case PlayEffect::SLICE_GATE:
+                default:
+                {
+                    // Gate mode + all stubs: sum input + playback
+                    mix_l = HardLimit(in_l + play_l);
+                    mix_r = HardLimit(in_r + play_r);
+                    break;
+                }
+            }
         }
         else
         {
-            // Not playing: input monitoring at VCA level
-            mix_l = in_l;
-            mix_r = in_r;
+            if(active_play_effect == PlayEffect::CROSSFADER)
+            {
+                float pos = eff_gate;
+                if(pos < 0.05f) pos = 0.0f;
+                if(pos > 0.95f) pos = 1.0f;
+                float gain_a = (pos <= 0.5f) ? 1.0f : (1.0f - pos) * 2.0f;
+                mix_l = in_l * gain_a;
+                mix_r = in_r * gain_a;
+            }
+            else
+            {
+                mix_l = in_l;
+                mix_r = in_r;
+            }
         }
 
-        out[0][i] = mix_l * output_volume;
-        out[1][i] = mix_r * output_volume;
+        if(startup_mute > 0)
+        {
+            out[0][i] = 0.0f;
+            out[1][i] = 0.0f;
+            startup_mute--;
+        }
+        else
+        {
+            out[0][i] = mix_l * output_volume;
+            out[1][i] = mix_r * output_volume;
+        }
     }
 
     // ── LEDs ───────────────────────────────────────────────
@@ -971,23 +1392,26 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     {
         if(config_tap_held && config_hold_counter >= CONFIG_RESET_THRESHOLD)
         {
-            hw.SetLed(0, 1.0f, 1.0f, 1.0f);
-            hw.SetLed(1, 1.0f, 1.0f, 1.0f);
-            hw.SetLed(2, 1.0f, 1.0f, 1.0f);
-            hw.SetLed(3, 1.0f, 1.0f, 1.0f);
+            // Clock toggled — bright blue flash
+            float blink = ((config_hold_counter / 9600) % 2 == 0) ? 1.0f : 0.3f;
+            hw.SetLed(0, 0.0f, 0.0f, blink);
+            hw.SetLed(1, 0.0f, 0.0f, blink);
+            hw.SetLed(2, 0.0f, 0.0f, blink);
+            hw.SetLed(3, 0.0f, 0.0f, blink);
         }
         else if(config_tap_held &&
                 config_hold_counter >= CONFIG_WARN_THRESHOLD)
         {
+            // Approaching clock toggle — blue ramp
             float hold_frac = static_cast<float>(
                 config_hold_counter - CONFIG_WARN_THRESHOLD)
                 / static_cast<float>(
                     CONFIG_RESET_THRESHOLD - CONFIG_WARN_THRESHOLD);
             float v = 0.3f + hold_frac * 0.7f;
-            hw.SetLed(0, v, 0.0f, 0.0f);
-            hw.SetLed(1, v, 0.0f, 0.0f);
-            hw.SetLed(2, v, 0.0f, 0.0f);
-            hw.SetLed(3, v, 0.0f, 0.0f);
+            hw.SetLed(0, 0.0f, 0.0f, v);
+            hw.SetLed(1, 0.0f, 0.0f, v);
+            hw.SetLed(2, 0.0f, 0.0f, v);
+            hw.SetLed(3, 0.0f, 0.0f, v);
         }
         else if(merge_done_timer > 0)
         {
@@ -1014,16 +1438,132 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         }
         else
         {
-            // Config: FIXED brightness. NO knob-proportional values.
-            // ADC jitter on knobs was causing brightness oscillation.
-            hw.SetLed(0, 0.15f, 0.15f, 0.15f);  // white = Bars
-            hw.SetLed(1, 0.0f, 0.08f, 0.15f);   // cyan  = BPM
-            hw.SetLed(2, 0.0f, 0.15f, 0.0f);    // green = Slices
-            hw.SetLed(3, 0.0f, 0.0f, 0.0f);     // OFF
+            // Config: show WHITE playhead from playback engine
+            // so user can see loop position while tweaking settings
+            RecordState cfg_led_state = sliceEngine.GetState();
+            bool cfg_playing = (cfg_led_state == RecordState::PLAYING ||
+                                cfg_led_state == RecordState::OVERDUBBING);
+            if(cfg_playing && playbackEngine.IsPlaying()
+               && !playbackEngine.IsOneshotDone())
+            {
+                float cfg_prog = playbackEngine.GetPlaybackProgress();
+                uint32_t ns = playbackEngine.GetNumSlices();
+                uint32_t rs = playbackEngine.GetStartSlice();
+                uint32_t re = playbackEngine.GetEndSlice();
+                if(re > 0) re--;
+                float norm_s = (ns > 0) ? static_cast<float>(rs) / static_cast<float>(ns) : 0.0f;
+                float norm_e = (ns > 0) ? static_cast<float>(re + 1) / static_cast<float>(ns) : 1.0f;
+                if(norm_e > 1.0f) norm_e = 1.0f;
+                float abs_pos = norm_s + cfg_prog * (norm_e - norm_s);
+                int head_q = static_cast<int>(abs_pos * 4.0f);
+                if(head_q > 3) head_q = 3;
+                if(head_q < 0) head_q = 0;
 
-            // Magenta flash: solid on/off when param changes
-            if(config_param_flash > 0 && config_flash_led < 3)
-                hw.SetLed(config_flash_led, 0.5f, 0.0f, 0.5f);
+                for(uint32_t l = 0; l < 4; l++)
+                {
+                    if(static_cast<int>(l) == head_q)
+                    {
+                        if(clock_mode_external)
+                            hw.SetLed(l, 0.1f, 0.1f, 0.5f);
+                        else
+                            hw.SetLed(l, 0.5f, 0.5f, 0.5f);
+                    }
+                    else
+                    {
+                        if(clock_mode_external)
+                            hw.SetLed(l, 0.02f, 0.02f, 0.06f);
+                        else
+                            hw.SetLed(l, 0.03f, 0.03f, 0.03f);
+                    }
+                }
+            }
+            else
+            {
+                for(uint32_t l = 0; l < 4; l++)
+                {
+                    if(clock_mode_external)
+                        hw.SetLed(l, 0.02f, 0.02f, 0.06f);  // Dim blue = ext clock
+                    else
+                        hw.SetLed(l, 0.03f, 0.03f, 0.03f);  // Dim white = int clock
+                }
+            }
+
+            // Purple parameter flash overlays
+            if(config_param_flash > 0 && config_flash_led == 99)
+            {
+                // Tap tempo: all 4 LEDs blue
+                for(uint32_t l = 0; l < 4; l++)
+                    hw.SetLed(l, 0.0f, 0.0f, 0.7f);
+            }
+            else if(config_param_flash > 0 && config_flash_led < 4)
+            {
+                // ALL 4 LEDs flash magenta for any top-row param change
+                for(uint32_t l = 0; l < 4; l++)
+                    hw.SetLed(l, 0.5f, 0.0f, 0.5f);
+            }
+
+            // Resample mode vis overlay (KNOB_1 moving)
+            if(resample_vis_timer > 0)
+            {
+                float fade = (resample_vis_timer > 100) ? 1.0f
+                             : static_cast<float>(resample_vis_timer) / 100.0f;
+                uint32_t rp = resample_vis_passes;
+
+                // Replace (0): fast flicker LED 0
+                // Fripp 1-4: solid fill LEDs 0..N-1
+                // Unity (5): fast flicker LED 3
+                for(uint32_t l = 0; l < 4; l++)
+                    hw.SetLed(l, 0.0f, 0.0f, 0.0f);
+
+                if(rp == 0)
+                {
+                    // Replace: fast flicker LED 0
+                    bool blink = ((resample_vis_timer / 8) % 2 == 0);
+                    float b = blink ? 0.7f * fade : 0.0f;
+                    hw.SetLed(0, b, 0.0f, b);
+                }
+                else if(rp >= 5)
+                {
+                    // Unity overdub: fast flicker LED 3
+                    bool blink = ((resample_vis_timer / 8) % 2 == 0);
+                    float b = blink ? 0.7f * fade : 0.0f;
+                    hw.SetLed(3, b, 0.0f, b);
+                }
+                else
+                {
+                    // Frippertronics 1-4: solid fill
+                    for(uint32_t l = 0; l < rp && l < 4; l++)
+                        hw.SetLed(l, 0.6f * fade, 0.0f, 0.6f * fade);
+                }
+            }
+
+            // Effect selection vis overlay (KNOB_3 or KNOB_5 moved)
+            if(effect_vis_timer > 0)
+            {
+                float fade = (effect_vis_timer > 100) ? 1.0f
+                             : static_cast<float>(effect_vis_timer) / 100.0f;
+                uint32_t idx;
+                uint32_t count;
+                if(effect_vis_id == 3)
+                {
+                    idx = static_cast<uint32_t>(config_audio_effect);
+                    count = static_cast<uint32_t>(AudioEffect::NUM_AUDIO_EFFECTS);
+                }
+                else
+                {
+                    idx = static_cast<uint32_t>(config_play_effect);
+                    count = static_cast<uint32_t>(PlayEffect::NUM_PLAY_EFFECTS);
+                }
+                // Solid LED at the selected position
+                // Audio effects: cyan, Play effects: green
+                for(uint32_t l = 0; l < 4; l++)
+                    hw.SetLed(l, 0.0f, 0.0f, 0.0f);
+                uint32_t led = (idx >= 4) ? 3 : idx;
+                if(effect_vis_id == 3)
+                    hw.SetLed(led, 0.0f, 0.5f * fade, 0.5f * fade);
+                else
+                    hw.SetLed(led, 0.0f, 0.5f * fade, 0.0f);
+            }
         }
     }
     else
@@ -1034,18 +1574,46 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     ledManager.Update(led_state, progress, sliceEngine.GetCurrentSlot(),
                           slot_states, clear_progress,
                           show_range, start_idx, end_idx, num_slices,
-                          cyan_flash, start_idx, oneshot_waiting);
+                          cyan_flash, start_idx, oneshot_waiting,
+                          threshold_rearm);
 
         for(uint32_t l = 0; l < 4; l++)
         {
             const LedManager::LedColor& c = ledManager.GetLed(l);
             hw.SetLed(l, c.r, c.g, c.b);
         }
+
+        // Crossfader position LED overlay (white indicator while moving)
+        if(IsCrossfaderMode() && xfade_vis_timer > 0 && !ledManager.IsSlotDisplayActive())
+        {
+            float pos = knob_5_raw;
+            // Fade out over last 100 ticks (~267ms)
+            float fade = (xfade_vis_timer > 100) ? 1.0f
+                         : static_cast<float>(xfade_vis_timer) / 100.0f;
+
+            // Position: only the active LED(s), no dim neighbors
+            float b0 = 0.0f, b1 = 0.0f, b2 = 0.0f, b3 = 0.0f;
+            if(pos < 0.2f)
+                b0 = 0.9f;
+            else if(pos < 0.4f)
+                b1 = 0.9f;
+            else if(pos < 0.6f)
+            { b1 = 0.9f; b2 = 0.9f; }
+            else if(pos < 0.8f)
+                b2 = 0.9f;
+            else
+                b3 = 0.9f;
+            hw.SetLed(0, b0*fade, b0*fade, b0*fade);
+            hw.SetLed(1, b1*fade, b1*fade, b1*fade);
+            hw.SetLed(2, b2*fade, b2*fade, b2*fade);
+            hw.SetLed(3, b3*fade, b3*fade, b3*fade);
+        }
     }
 
     hw.UpdateLeds();
     if(config_param_flash > 0) config_param_flash--;
 }
+
 
 int main(void)
 {
@@ -1055,9 +1623,58 @@ int main(void)
 
     float sample_rate = hw.AudioSampleRate();
 
+    // Audio effects handled by spectral modes in pitch shifter
+
+    // ── Startup LED animation ──────────────────────────────
+    // Outside-in to solid white, then fade out.
+    // Multiple UpdateLeds calls per step to ensure hardware registers.
+    for(int r = 0; r < 5; r++)
+    {
+        hw.SetLed(0, 0, 0, 0); hw.SetLed(1, 0, 0, 0);
+        hw.SetLed(2, 0, 0, 0); hw.SetLed(3, 0, 0, 0);
+        hw.UpdateLeds(); hw.DelayMs(20);
+    }
+    hw.DelayMs(100);
+
+    // Step 1: Outer LEDs solid white
+    for(int r = 0; r < 10; r++)
+    {
+        hw.SetLed(0, 0.7f, 0.7f, 0.7f); hw.SetLed(1, 0, 0, 0);
+        hw.SetLed(2, 0, 0, 0);           hw.SetLed(3, 0.7f, 0.7f, 0.7f);
+        hw.UpdateLeds(); hw.DelayMs(25);
+    }
+
+    // Step 2: Inner LEDs join — all 4 solid white
+    for(int r = 0; r < 10; r++)
+    {
+        hw.SetLed(0, 0.7f, 0.7f, 0.7f); hw.SetLed(1, 0.7f, 0.7f, 0.7f);
+        hw.SetLed(2, 0.7f, 0.7f, 0.7f); hw.SetLed(3, 0.7f, 0.7f, 0.7f);
+        hw.UpdateLeds(); hw.DelayMs(25);
+    }
+
+    // Step 3: Brighten
+    for(int r = 0; r < 12; r++)
+    {
+        hw.SetLed(0, 1, 1, 1); hw.SetLed(1, 1, 1, 1);
+        hw.SetLed(2, 1, 1, 1); hw.SetLed(3, 1, 1, 1);
+        hw.UpdateLeds(); hw.DelayMs(25);
+    }
+
+    // Step 4: Slow fade out
+    for(int s = 20; s >= 0; s--)
+    {
+        float v = static_cast<float>(s) / 20.0f;
+        hw.SetLed(0, v, v, v); hw.SetLed(1, v, v, v);
+        hw.SetLed(2, v, v, v); hw.SetLed(3, v, v, v);
+        hw.UpdateLeds(); hw.DelayMs(40);
+    }
+    hw.DelayMs(100);
+
     active_settings.bars   = 1;
     active_settings.slices = 16;
     active_settings.bpm    = 120.0f;
+    active_settings.overdub_feedback = 0.0f;
+    active_settings.resample_passes = 0;
     staged_settings = active_settings;
 
     prev_staged_bars   = 1;
@@ -1078,19 +1695,15 @@ int main(void)
     bool loaded = persistManager.LoadOnBoot();
     if(loaded)
     {
-        // Restore settings from flash
         if(persistManager.HasLoadedSettings())
         {
             active_settings = persistManager.GetLoadedSettings();
             staged_settings = active_settings;
             sliceEngine.SetSettings(active_settings);
-
-            // Sync prev_staged so settings page doesn't flash on first enter
             prev_staged_bars   = active_settings.bars;
             prev_staged_slices = active_settings.slices;
             prev_staged_bpm    = active_settings.bpm;
         }
-        // Start playback of restored slot 0
         playbackEngine.StartPlayback();
     }
 
@@ -1098,25 +1711,20 @@ int main(void)
     ck_speed.Catch(0.5f);
     ck_pitch.Catch(0.5f);
     ck_end.Catch(1.0f);
-    ck_gate.Catch(1.0f);
+    ck_gate.Catch(0.5f);
     ck_input_vol.Catch(1.0f);
 
     hw.StartAdc();
     hw.StartAudio(AudioCallback);
 
-    // ── Main loop: persistence + LED save feedback ────────
     for(;;)
     {
-        // Check if audio callback requested a save
         if(save_slot0_pending && !persistManager.IsSaving())
         {
             save_slot0_pending = false;
             persistManager.StartSave();
         }
-
-        // Tick the persistence state machine (chunked writes)
         persistManager.Tick();
-
         hw.DelayMs(1);
     }
 }

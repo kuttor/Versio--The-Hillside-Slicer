@@ -64,7 +64,7 @@ class PlaybackEngine
         xfade_prev_r_   = 0.0f;
         prev_start_     = 0;
         start_flash_timer_ = 0;
-        gate_fade_counter_ = 0;
+        gate_fade_counter_ = 0; gate_fadein_counter_ = 0;
         gate_was_open_     = true;
         play_mode_      = PlaybackMode::LOOP;
         oneshot_done_   = false;
@@ -85,7 +85,7 @@ class PlaybackEngine
         xfade_total_   = XFADE_MAX;
         xfade_prev_l_ = 0.0f;
         xfade_prev_r_ = 0.0f;
-        gate_fade_counter_ = 0;
+        gate_fade_counter_ = 0; gate_fadein_counter_ = 0;
         gate_was_open_     = true;
 
         // Reset pitch buffers: fresh prime with new audio
@@ -109,7 +109,7 @@ class PlaybackEngine
         xfade_total_   = XFADE_MAX;
         xfade_counter_ = XFADE_MAX;
         gate_was_open_ = true;
-        gate_fade_counter_ = 0;
+        gate_fade_counter_ = 0; gate_fadein_counter_ = 0;
     }
 
     void ResetPitchShifters()
@@ -146,7 +146,7 @@ class PlaybackEngine
         read_pos_    = 0.0;
         slice_timer_ = 0.0;
         gate_was_open_ = true;
-        gate_fade_counter_ = 0;
+        gate_fade_counter_ = 0; gate_fadein_counter_ = 0;
     }
 
     // ── Parameters ─────────────────────────────────────────
@@ -173,9 +173,9 @@ class PlaybackEngine
         }
         float mapped;
         if(normalized < 0.45f)
-            mapped = -2.0f * (1.0f - normalized / 0.45f);
+            mapped = -1.0f * (1.0f - normalized / 0.45f);
         else
-            mapped = 2.0f * (normalized - 0.55f) / 0.45f;
+            mapped = 1.0f * (normalized - 0.55f) / 0.45f;
         speed_ratio_ = SafeRatio(powf(2.0f, mapped));
     }
 
@@ -186,38 +186,35 @@ class PlaybackEngine
         // Center to bipolar: -1.0 to +1.0
         float centered = (normalized - 0.5f) * 2.0f;
 
-        // Dead zone at noon (4% each side = 8% total)
-        if(centered > -0.08f && centered < 0.08f)
+        // Dead zone at noon (6% each side = 12% total)
+        if(centered > -0.12f && centered < 0.12f)
         {
             pitch_l_.SetFactor(1.0f);
             pitch_r_.SetFactor(1.0f);
             return;
         }
 
+        // Symmetric: +/-12 semitones (1 octave each way)
         float semitones;
         if(centered > 0.0f)
         {
-            // CW: +1 to +12 semitones (linear)
-            float t = (centered - 0.08f) / 0.92f;  // 0.0 to 1.0
+            float t = (centered - 0.12f) / 0.88f;
             semitones = t * 12.0f;
         }
         else
         {
-            // CCW: -1 to -24 semitones (linear)
-            float t = (centered + 0.08f) / 0.92f;  // -1.0 to 0.0
-            semitones = t * 24.0f;
+            float t = (centered + 0.12f) / 0.88f;
+            semitones = t * 12.0f;
         }
 
         // Quantize to nearest semitone
         semitones = roundf(semitones);
-
-        // Clamp
         if(semitones > 12.0f)  semitones = 12.0f;
-        if(semitones < -24.0f) semitones = -24.0f;
+        if(semitones < -12.0f) semitones = -12.0f;
 
         float factor = powf(2.0f, semitones / 12.0f);
         if(factor != factor) factor = 1.0f;
-        factor = Clampf(factor, 0.25f, 2.0f);
+        factor = Clampf(factor, 0.5f, 2.0f);
         pitch_l_.SetFactor(factor);
         pitch_r_.SetFactor(factor);
     }
@@ -289,6 +286,20 @@ class PlaybackEngine
                        / static_cast<float>(total), 0.0f, 1.0f);
     }
 
+    uint32_t GetCurrentSlice() const { return current_slice_; }
+
+    /** Progress within the current slice: 0.0 = start, 1.0 = end */
+    float GetSliceProgress() const
+    {
+        if(!is_playing_ || !slices_) return 0.0f;
+        const SlotHeader& hdr = slices_->GetHeader();
+        uint32_t sidx = ClampU(current_slice_, hdr.num_slices);
+        double win_len = static_cast<double>(hdr.slices[sidx].length)
+                       / static_cast<double>(speed_ratio_);
+        if(win_len <= 0.0) return 0.0f;
+        return Clampf(static_cast<float>(slice_timer_ / win_len), 0.0f, 1.0f);
+    }
+
     // ── Audio ──────────────────────────────────────────────
 
     void Process(float& out_l, float& out_r)
@@ -328,17 +339,28 @@ class PlaybackEngine
 
         double win_frac = slice_timer_ / window_len;
 
-        // ── Gate with state-tracked fade ────────────────────
+        // ── Gate with fade-in and fade-out ──────────────────
         bool gate_open = (win_frac <= static_cast<double>(slice_gate_));
 
         if(gate_was_open_ && !gate_open)
             gate_fade_counter_ = GATE_FADE_SAMPLES;
+        if(!gate_was_open_ && gate_open)
+            gate_fadein_counter_ = GATE_FADE_SAMPLES;
         gate_was_open_ = gate_open;
 
         float gate_gain = 0.0f;
         if(gate_open)
         {
-            gate_gain = 1.0f;
+            if(gate_fadein_counter_ > 0)
+            {
+                gate_gain = 1.0f - static_cast<float>(gate_fadein_counter_)
+                            / static_cast<float>(GATE_FADE_SAMPLES);
+                gate_fadein_counter_--;
+            }
+            else
+            {
+                gate_gain = 1.0f;
+            }
         }
         else if(gate_fade_counter_ > 0)
         {
@@ -358,26 +380,16 @@ class PlaybackEngine
             float samp_l = HermiteRead(buf_l, slice.length, read_pos_);
             float samp_r = HermiteRead(buf_r, slice.length, read_pos_);
 
-            // Granular pitch shift (lightweight, no FIFO dependency)
+            // All 4 audio effects run through the same spectral processor.
+            // Mode determines bin manipulation (pitch/freq/reso/comb).
             raw_l = pitch_l_.Process(samp_l);
             raw_r = pitch_r_.Process(samp_r);
-
-            // Fade near end of slice data (adaptive to slice length)
-            uint32_t end_fade = AdaptiveXfade(static_cast<uint32_t>(slice_len));
-            float remaining = static_cast<float>(slice_len - read_pos_);
-            if(remaining < static_cast<float>(end_fade)
-               && remaining > 0.0f)
-            {
-                float fade = remaining / static_cast<float>(end_fade);
-                raw_l *= fade;
-                raw_r *= fade;
-            }
 
             raw_l *= gate_gain;
             raw_r *= gate_gain;
         }
 
-        // Crossfade at slice/knob transitions
+        // Crossfade only at non-contiguous transitions
         if(xfade_counter_ > 0)
         {
             float t = static_cast<float>(xfade_counter_)
@@ -403,8 +415,7 @@ class PlaybackEngine
   private:
     void AdvanceSlice(uint32_t s0, uint32_t s1)
     {
-        xfade_prev_l_ = prev_out_l_;
-        xfade_prev_r_ = prev_out_r_;
+        uint32_t prev_slice = current_slice_;
 
         slice_timer_ = 0.0;
         read_pos_    = 0.0;
@@ -420,22 +431,47 @@ class PlaybackEngine
             current_slice_ = s0;
         }
 
-        // Adaptive crossfade based on the slice we're entering
+        // Only crossfade if slices are NOT contiguous (e.g., loop wrap).
+        // For contiguous slices, audio is continuous — crossfade would
+        // only introduce artifacts via pitch shifter state interaction.
+        bool need_xfade = true;
         if(slices_)
         {
             const SlotHeader& hdr = slices_->GetHeader();
-            uint32_t sidx = ClampU(current_slice_, hdr.num_slices);
-            xfade_total_   = AdaptiveXfade(hdr.slices[sidx].length);
-            xfade_counter_ = xfade_total_;
+            uint32_t pi = ClampU(prev_slice, hdr.num_slices);
+            uint32_t ni = ClampU(current_slice_, hdr.num_slices);
+            // Contiguous: next slice starts where previous ended
+            if(hdr.slices[pi].start_sample + hdr.slices[pi].length
+               == hdr.slices[ni].start_sample)
+            {
+                need_xfade = false;
+            }
         }
-        else
+
+        if(need_xfade)
         {
-            xfade_total_   = XFADE_MAX;
-            xfade_counter_ = XFADE_MAX;
+            xfade_prev_l_ = prev_out_l_;
+            xfade_prev_r_ = prev_out_r_;
+            // Reset pitch shifters at discontinuity (loop wrap, knob jump)
+            // so WSOLA doesn't mix old-end audio with new-start audio
+            pitch_l_.SoftReset();
+            pitch_r_.SoftReset();
+            if(slices_)
+            {
+                const SlotHeader& hdr = slices_->GetHeader();
+                uint32_t sidx = ClampU(current_slice_, hdr.num_slices);
+                xfade_total_   = AdaptiveXfade(hdr.slices[sidx].length);
+                xfade_counter_ = xfade_total_;
+            }
+            else
+            {
+                xfade_total_   = XFADE_MAX;
+                xfade_counter_ = XFADE_MAX;
+            }
         }
 
         gate_was_open_ = true;
-        gate_fade_counter_ = 0;
+        gate_fade_counter_ = 0; gate_fadein_counter_ = 0;
     }
 
     static float Clampf(float v, float lo, float hi)
@@ -522,6 +558,7 @@ class PlaybackEngine
 
     // Gate fade
     uint32_t gate_fade_counter_ = 0;
+    uint32_t gate_fadein_counter_ = 0;
     bool     gate_was_open_     = true;
 
     // Play mode
@@ -532,7 +569,7 @@ class PlaybackEngine
     uint32_t prev_start_         = 0;
     uint32_t start_flash_timer_  = 0;
 
-    // WSOLA pitch shifter
+    // Pitch shifter pair
     PitchShifter pitch_l_;
     PitchShifter pitch_r_;
 };

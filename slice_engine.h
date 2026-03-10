@@ -71,7 +71,20 @@ struct RecordSettings
     uint32_t bars   = 1;    // 1, 2, 4, 8
     uint32_t slices = 16;   // 2, 4, 8, 16, 32, 64
     float    bpm    = 120.0f; // 40-300
-    float    overdub_feedback = 1.0f;  // 1.0 = pure overdub, 0.0 = replace
+    float    overdub_feedback = 1.0f;  // Computed from resample_passes
+    uint32_t resample_passes = 0;     // 0=replace, 1-4=frippertronics, 5=unity overdub
+    uint8_t  audio_effect = 0;       // AudioEffect enum value
+    uint8_t  play_effect  = 0;       // PlayEffect enum value
+
+    /** Compute overdub feedback from resample_passes.
+     *  Target: ~5% (-26dB) of original content remaining after N passes. */
+    float ComputeFeedback() const
+    {
+        if(resample_passes == 0) return 0.0f;        // Replace
+        if(resample_passes >= 5) return 1.0f;        // Unity overdub
+        // Frippertronics: feedback^N = 0.05 → feedback = 0.05^(1/N)
+        return powf(0.05f, 1.0f / static_cast<float>(resample_passes));
+    }
 
     /** Total clock ticks for a full recording */
     uint32_t TotalTicks() const { return bars * TICKS_PER_BAR; }
@@ -116,7 +129,7 @@ class SliceEngine
         current_slot_  = 0;
         record_pos_    = 0;
         beat_count_    = 0;
-        threshold_     = 0.015f;
+        threshold_     = 0.025f;
     }
 
     // ── Settings ───────────────────────────────────────────
@@ -264,6 +277,26 @@ class SliceEngine
         preroll_pos_ = (preroll_pos_ + 1) % PREROLL_SAMPLES;
     }
 
+    /** Cancel armed state. Returns to PLAYING if content exists, else EMPTY. */
+    void CancelArm()
+    {
+        RecordState& st = states_[current_slot_];
+        if(st == RecordState::ARMED)
+        {
+            const SlotHeader& hdr = headers_[current_slot_];
+            st = (hdr.has_content && hdr.total_samples > 0)
+                 ? RecordState::PLAYING : RecordState::EMPTY;
+        }
+    }
+
+    /** Set which slices should contain audio during recording.
+     *  Call BEFORE ArmRecording. */
+    void SetRecordRange(uint32_t start_sl, uint32_t end_sl)
+    {
+        rec_start_sl_ = start_sl;
+        rec_end_sl_   = end_sl;
+    }
+
     void ArmRecording(RecordMode mode)
     {
         record_mode_   = mode;
@@ -337,8 +370,33 @@ class SliceEngine
         uint32_t offset = current_slot_ * MAX_SLOT_SAMPLES;
         if(record_pos_ < MAX_SLOT_SAMPLES)
         {
-            buf_l_[offset + record_pos_] = left;
-            buf_r_[offset + record_pos_] = right;
+            // Gate: only record audio within the selected slice range.
+            // Outside the range, write silence.
+            bool in_range = true;
+            uint32_t period = headers_[current_slot_].clock_period;
+            if(period == 0) period = settings_.ClockPeriod(sample_rate_);
+            uint32_t expected_total = settings_.TotalTicks() * period;
+            if(expected_total > 0 && settings_.slices > 0)
+            {
+                uint32_t slice_len = expected_total / settings_.slices;
+                if(slice_len > 0)
+                {
+                    uint32_t cur_slice = record_pos_ / slice_len;
+                    if(cur_slice > rec_end_sl_ || cur_slice < rec_start_sl_)
+                        in_range = false;
+                }
+            }
+
+            if(in_range)
+            {
+                buf_l_[offset + record_pos_] = left;
+                buf_r_[offset + record_pos_] = right;
+            }
+            else
+            {
+                buf_l_[offset + record_pos_] = 0.0f;
+                buf_r_[offset + record_pos_] = 0.0f;
+            }
             record_pos_++;
         }
         else
@@ -540,20 +598,18 @@ class SliceEngine
         if(states_[current_slot_] != RecordState::RECORDING)
             return 0.0f;
 
-        uint32_t total_ticks = settings_.TotalTicks();
-
-        if(beat_count_ > 0)
-            return static_cast<float>(beat_count_)
-                   / static_cast<float>(total_ticks);
-
-        // Before first tick, estimate from clock period
+        // Always use sample-based estimation for smooth LED fill.
+        // The tick-based method causes discontinuities when the
+        // first clock tick arrives (progress jumps backward).
         uint32_t period = headers_[current_slot_].clock_period;
         if(period == 0) period = settings_.ClockPeriod(sample_rate_);
-        uint32_t expected_total = total_ticks * period;
+        uint32_t expected_total = settings_.TotalTicks() * period;
         if(expected_total == 0) return 0.0f;
 
-        return static_cast<float>(record_pos_)
-               / static_cast<float>(expected_total);
+        float p = static_cast<float>(record_pos_)
+                / static_cast<float>(expected_total);
+        if(p > 1.0f) p = 1.0f;
+        return p;
     }
 
   private:
@@ -603,7 +659,7 @@ class SliceEngine
     float*     preroll_l_   = nullptr;
     float*     preroll_r_   = nullptr;
     float      sample_rate_ = 96000.0f;
-    float      threshold_   = 0.015f;
+    float      threshold_   = 0.025f;
 
     SlotHeader     headers_[NUM_SLOTS];
     RecordState    states_[NUM_SLOTS];
@@ -612,6 +668,8 @@ class SliceEngine
     uint32_t   current_slot_   = 0;
     uint32_t   record_pos_     = 0;
     uint32_t   beat_count_     = 0;
+    uint32_t   rec_start_sl_   = 0;
+    uint32_t   rec_end_sl_     = 0;
     uint32_t   preroll_pos_    = 0;
     RecordMode record_mode_    = RecordMode::IMMEDIATE;
 };
