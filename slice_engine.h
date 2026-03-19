@@ -315,6 +315,32 @@ class SliceEngine
             headers_[current_slot_] = SlotHeader();
             headers_[current_slot_].sample_rate = sample_rate_;
         }
+
+        // Pre-advance past slices before the selected range.
+        // Fills pre-range samples with silence so recording starts
+        // at the user's selected position immediately.
+        if(rec_start_sl_ > 0 && settings_.slices > 0)
+        {
+            uint32_t period = settings_.ClockPeriod(sample_rate_);
+            uint32_t expected_total = settings_.TotalTicks() * period;
+            uint32_t slice_len = expected_total / settings_.slices;
+            uint32_t skip_samples = rec_start_sl_ * slice_len;
+            uint32_t skip_beats = (settings_.TotalTicks() * rec_start_sl_)
+                                  / settings_.slices;
+
+            // Pre-fill silence in the skipped region
+            uint32_t offset = current_slot_ * MAX_SLOT_SAMPLES;
+            if(skip_samples > MAX_SLOT_SAMPLES)
+                skip_samples = MAX_SLOT_SAMPLES;
+            for(uint32_t s = 0; s < skip_samples; s++)
+            {
+                buf_l_[offset + s] = 0.0f;
+                buf_r_[offset + s] = 0.0f;
+            }
+
+            record_pos_ = skip_samples;
+            beat_count_ = skip_beats;
+        }
     }
 
     void OnClockTick(uint32_t clock_period)

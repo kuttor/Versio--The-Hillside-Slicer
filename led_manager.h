@@ -123,7 +123,8 @@ class LedManager
   private:
     // Background brightness for in-range, non-playhead LEDs.
     // 0.10 is clearly visible and well above PWM flicker threshold.
-    static constexpr float BG = 0.10f;
+    static constexpr float BG  = 0.10f;
+    static constexpr float DIM = 0.20f;  // Non-playhead in-range LEDs
 
     // ── Render functions ────────────────────────────────────
 
@@ -194,7 +195,7 @@ class LedManager
     {
         if(total_slices == 0) { RenderAllOff(); return; }
 
-        // Normalize range to 0.0–1.0
+        // Normalize range to 0.0-1.0
         float norm_s = static_cast<float>(range_start)
                      / static_cast<float>(total_slices);
         float norm_e = static_cast<float>(range_end + 1)
@@ -210,11 +211,10 @@ class LedManager
 
         for(int i = 0; i < 4; i++)
         {
-            // Overlap test: does LED quadrant overlap the slice range?
             float q_lo = static_cast<float>(i) * 0.25f;
             float q_hi = q_lo + 0.25f;
 
-            // RANGE CHECK: no overlap -> completely off
+            // Outside slice range: off
             if(q_lo >= norm_e || q_hi <= norm_s)
             {
                 leds_[i] = {0.0f, 0.0f, 0.0f};
@@ -227,18 +227,19 @@ class LedManager
                 if(overdub)
                     leds_[i] = {1.0f, 0.0f, 0.0f};       // Red
                 else if(threshold_armed)
-                    leds_[i] = {0.8f, 0.5f, 0.0f};       // Yellow/amber
+                    leds_[i] = {0.8f, 0.5f, 0.0f};        // Amber
                 else
-                    leds_[i] = {0.0f, 1.0f, 0.0f};       // Green
+                    leds_[i] = {0.0f, 1.0f, 0.0f};        // Green
             }
+            // ALL OTHER in-range LEDs: dim solid
             else
             {
                 if(overdub)
-                    leds_[i] = {BG, 0.0f, 0.0f};         // Dim red
+                    leds_[i] = {DIM, 0.0f, 0.0f};
                 else if(threshold_armed)
-                    leds_[i] = {BG, BG * 0.6f, 0.0f};    // Dim amber
+                    leds_[i] = {DIM, DIM * 0.6f, 0.0f};
                 else
-                    leds_[i] = {0.0f, BG, 0.0f};         // Dim green
+                    leds_[i] = {0.0f, DIM, 0.0f};
             }
         }
     }

@@ -22,9 +22,6 @@
  */
 
 static constexpr uint32_t XFADE_MAX     = 1024;
-static constexpr uint32_t GATE_FADE_SAMPLES = 384;
-// Crossfade adapts to slice length — never more than 12% of a slice
-// so short slices (high slice counts) don't get eaten by fades.
 
 enum class PlaybackMode
 {
@@ -52,10 +49,13 @@ class PlaybackEngine
         start_slice_    = 0;
         end_slice_      = 15;
         speed_ratio_    = 1.0f;
-        slice_gate_     = 1.0f;
+        bpm_ratio_      = 1.0f;
+        current_window_len_ = 0.0;
         is_playing_     = false;
         read_pos_       = 0.0;
         slice_timer_    = 0.0;
+        fade_counter_   = 0;
+        fade_abs_pos_   = 0.0;
         current_slice_  = 0;
         prev_out_l_     = 0.0f;
         prev_out_r_     = 0.0f;
@@ -64,8 +64,6 @@ class PlaybackEngine
         xfade_prev_r_   = 0.0f;
         prev_start_     = 0;
         start_flash_timer_ = 0;
-        gate_fade_counter_ = 0; gate_fadein_counter_ = 0;
-        gate_was_open_     = true;
         play_mode_      = PlaybackMode::LOOP;
         oneshot_done_   = false;
         pitch_l_.Reset();
@@ -77,6 +75,7 @@ class PlaybackEngine
         current_slice_ = start_slice_;
         read_pos_    = 0.0;
         slice_timer_ = 0.0;
+        fade_counter_ = 0;
         is_playing_  = true;
         oneshot_done_ = false;
         prev_out_l_  = 0.0f;
@@ -85,11 +84,8 @@ class PlaybackEngine
         xfade_total_   = XFADE_MAX;
         xfade_prev_l_ = 0.0f;
         xfade_prev_r_ = 0.0f;
-        gate_fade_counter_ = 0; gate_fadein_counter_ = 0;
-        gate_was_open_     = true;
 
-        // Reset pitch buffers: fresh prime with new audio
-        // Without this, WSOLA correlates against stale data
+        // Reset pitch shifter state for fresh audio content
         pitch_l_.Reset();
         pitch_r_.Reset();
     }
@@ -108,8 +104,6 @@ class PlaybackEngine
         read_pos_      = 0.0;
         xfade_total_   = XFADE_MAX;
         xfade_counter_ = XFADE_MAX;
-        gate_was_open_ = true;
-        gate_fade_counter_ = 0; gate_fadein_counter_ = 0;
     }
 
     void ResetPitchShifters()
@@ -145,8 +139,6 @@ class PlaybackEngine
         // Reset positions to start of current slice
         read_pos_    = 0.0;
         slice_timer_ = 0.0;
-        gate_was_open_ = true;
-        gate_fade_counter_ = 0; gate_fadein_counter_ = 0;
     }
 
     // ── Parameters ─────────────────────────────────────────
@@ -219,9 +211,13 @@ class PlaybackEngine
         pitch_r_.SetFactor(factor);
     }
 
-    void SetSliceGate(float normalized)
+    /** Multiply the current speed by a BPM ratio.
+     *  Call AFTER SetSpeed. 1.0 = no change. */
+    void SetBpmRatio(float ratio)
     {
-        slice_gate_ = Clampf(normalized, 0.01f, 1.0f);
+        if(ratio < 0.25f) ratio = 0.25f;
+        if(ratio > 4.0f)  ratio = 4.0f;
+        bpm_ratio_ = ratio;
     }
 
     void SetAutoAdvance(bool) {}
@@ -229,7 +225,18 @@ class PlaybackEngine
     void TriggerChoke() {}
     void TriggerOpen() {}
 
-    // ── Queries ────────────────────────────────────────────
+    /** Set swing amount. 0.0 = straight, 1.0 = heavy triplet swing.
+     *  8th-note swing: pairs of slices form 8th notes.
+     *  Even pairs play longer, odd pairs play shorter. */
+    void SetSwing(float normalized)
+    {
+        if(normalized < 0.0f) normalized = 0.0f;
+        if(normalized > 1.0f) normalized = 1.0f;
+        // Max 0.65: very audible groove, safe at all speed settings.
+        swing_ = normalized * 0.65f;
+    }
+
+        // ── Queries ────────────────────────────────────────────
 
     uint32_t GetStartSlice() const { return start_slice_; }
     uint32_t GetEndSlice() const { return end_slice_ + 1; }
@@ -276,8 +283,10 @@ class PlaybackEngine
         uint32_t cs = ClampU(current_slice_, hdr.num_slices);
         uint32_t done = (cs >= s0) ? (cs - s0) : 0;
 
-        double win_len = static_cast<double>(hdr.slices[cs].length)
-                         / static_cast<double>(speed_ratio_);
+        double win_len = current_window_len_;
+        if(win_len <= 0.0)
+            win_len = static_cast<double>(hdr.slices[cs].length)
+                      / static_cast<double>(speed_ratio_ * bpm_ratio_);
         float frac = (win_len > 0.0)
                      ? static_cast<float>(slice_timer_ / win_len) : 0.0f;
         frac = Clampf(frac, 0.0f, 1.0f);
@@ -294,8 +303,10 @@ class PlaybackEngine
         if(!is_playing_ || !slices_) return 0.0f;
         const SlotHeader& hdr = slices_->GetHeader();
         uint32_t sidx = ClampU(current_slice_, hdr.num_slices);
-        double win_len = static_cast<double>(hdr.slices[sidx].length)
-                       / static_cast<double>(speed_ratio_);
+        double win_len = current_window_len_;
+        if(win_len <= 0.0)
+            win_len = static_cast<double>(hdr.slices[sidx].length)
+                      / static_cast<double>(speed_ratio_ * bpm_ratio_);
         if(win_len <= 0.0) return 0.0f;
         return Clampf(static_cast<float>(slice_timer_ / win_len), 0.0f, 1.0f);
     }
@@ -316,78 +327,98 @@ class PlaybackEngine
         uint32_t s1 = ClampU(end_slice_, hdr.num_slices);
         if(s1 < s0) s1 = s0;
 
-        // Start knob changed: crossfade into new position
+        // Start knob changed: buffer-fade into new position
         if(current_slice_ < s0 || current_slice_ > s1)
         {
-            xfade_prev_l_ = prev_out_l_;
-            xfade_prev_r_ = prev_out_r_;
+            // Start fade from current absolute position
+            uint32_t ci = ClampU(current_slice_, hdr.num_slices);
+            fade_abs_pos_ = static_cast<double>(hdr.slices[ci].start_sample)
+                            + read_pos_;
+            fade_total_ = FADE_LEN;
+            fade_counter_ = FADE_LEN;
             current_slice_ = s0;
-            uint32_t slen = hdr.slices[ClampU(s0, hdr.num_slices)].length;
-            xfade_total_   = AdaptiveXfade(slen);
-            xfade_counter_ = xfade_total_;
             read_pos_ = 0.0;
             slice_timer_ = 0.0;
         }
 
         uint32_t sidx = ClampU(current_slice_, hdr.num_slices);
+
         const SliceInfo& slice = hdr.slices[sidx];
-        if(slice.length == 0) { AdvanceSlice(s0, s1); return; }
+        if(slice.length == 0) { AdvanceSlice(s0, s1, XFADE_MAX); return; }
 
         double slice_len = static_cast<double>(slice.length);
-        double window_len = slice_len / static_cast<double>(speed_ratio_);
+        double window_len = slice_len
+                            / static_cast<double>(speed_ratio_ * bpm_ratio_);
         if(window_len < 1.0) window_len = 1.0;
 
-        double win_frac = slice_timer_ / window_len;
+        // Even groups: ratio > 1.0 = stretch (plays slower, takes longer)
+        // Odd groups: ratio < 1.0 = compress (plays faster, takes shorter)
+        // Window timing controls WHEN slices advance.
+        double swing_window = window_len;
 
-        // ── Gate with fade-in and fade-out ──────────────────
-        bool gate_open = (win_frac <= static_cast<double>(slice_gate_));
-
-        if(gate_was_open_ && !gate_open)
-            gate_fade_counter_ = GATE_FADE_SAMPLES;
-        if(!gate_was_open_ && gate_open)
-            gate_fadein_counter_ = GATE_FADE_SAMPLES;
-        gate_was_open_ = gate_open;
-
-        float gate_gain = 0.0f;
-        if(gate_open)
+        if(swing_ > 0.001f)
         {
-            if(gate_fadein_counter_ > 0)
+            uint32_t group = current_slice_ / 2;
+            bool even_group = !(group & 1);
+            if(even_group)
             {
-                gate_gain = 1.0f - static_cast<float>(gate_fadein_counter_)
-                            / static_cast<float>(GATE_FADE_SAMPLES);
-                gate_fadein_counter_--;
+                swing_window = window_len * static_cast<double>(1.0f + swing_);
             }
             else
             {
-                gate_gain = 1.0f;
+                swing_window = window_len * static_cast<double>(1.0f - swing_);
             }
+            if(swing_window < 1024.0) swing_window = 1024.0;
         }
-        else if(gate_fade_counter_ > 0)
+
+
+        current_window_len_ = swing_window;
+        last_adj_start_ = slice.start_sample;
+
+        // Read audio at constant speed — swing only changes WHEN slices advance
+        const float* buf_l = slices_->GetSlotBufL() + slice.start_sample;
+        const float* buf_r = slices_->GetSlotBufR() + slice.start_sample;
+
+        double clamped = read_pos_;
+        if(clamped < 0.0) clamped = 0.0;
+
+        float samp_l, samp_r;
+        if(read_pos_ >= slice_len)
         {
-            gate_gain = static_cast<float>(gate_fade_counter_)
-                        / static_cast<float>(GATE_FADE_SAMPLES);
-            gate_fade_counter_--;
+            // Past content end (even swing groups): output silence
+            samp_l = 0.0f;
+            samp_r = 0.0f;
         }
-
-        float raw_l = 0.0f, raw_r = 0.0f;
-
-        if(gate_gain > 0.0f && read_pos_ >= 0.0 && read_pos_ < slice_len)
+        else
         {
-            const float* buf_l = slices_->GetSlotBufL()
-                                 + slice.start_sample;
-            const float* buf_r = slices_->GetSlotBufR()
-                                 + slice.start_sample;
-            float samp_l = HermiteRead(buf_l, slice.length, read_pos_);
-            float samp_r = HermiteRead(buf_r, slice.length, read_pos_);
-
-            // All 4 audio effects run through the same spectral processor.
-            // Mode determines bin manipulation (pitch/freq/reso/comb).
-            raw_l = pitch_l_.Process(samp_l);
-            raw_r = pitch_r_.Process(samp_r);
-
-            raw_l *= gate_gain;
-            raw_r *= gate_gain;
+            samp_l = HermiteRead(buf_l, slice.length, clamped);
+            samp_r = HermiteRead(buf_r, slice.length, clamped);
         }
+
+        // Buffer-level crossfade for non-contiguous transitions
+        if(fade_counter_ > 0)
+        {
+            const float* slot_l = slices_->GetSlotBufL();
+            const float* slot_r = slices_->GetSlotBufR();
+            uint32_t total = hdr.total_samples;
+            if(fade_abs_pos_ >= 0.0
+               && fade_abs_pos_ < static_cast<double>(total))
+            {
+                float f_l = HermiteRead(slot_l, total, fade_abs_pos_);
+                float f_r = HermiteRead(slot_r, total, fade_abs_pos_);
+                float t = static_cast<float>(fade_counter_)
+                          / static_cast<float>(fade_total_);
+                samp_l = samp_l * (1.0f - t) + f_l * t;
+                samp_r = samp_r * (1.0f - t) + f_r * t;
+            }
+            fade_abs_pos_ += static_cast<double>(speed_ratio_ * bpm_ratio_);
+            fade_counter_--;
+        }
+
+        // Pitch shift: bypass at unity handled inside PitchShifter
+        // with delay-matched raw path (no click on transitions).
+        float raw_l = pitch_l_.Process(samp_l);
+        float raw_r = pitch_r_.Process(samp_r);
 
         // Crossfade only at non-contiguous transitions
         if(xfade_counter_ > 0)
@@ -404,18 +435,21 @@ class PlaybackEngine
         prev_out_l_ = raw_l;
         prev_out_r_ = raw_r;
 
-        // Advance
+        // Advance at constant speed, swing_window controls WHEN next slice fires
         slice_timer_ += 1.0;
-        read_pos_    += static_cast<double>(speed_ratio_);
+        read_pos_    += static_cast<double>(speed_ratio_ * bpm_ratio_);
 
-        if(slice_timer_ >= window_len)
-            AdvanceSlice(s0, s1);
+        if(slice_timer_ >= swing_window)
+            AdvanceSlice(s0, s1, swing_window);
     }
 
   private:
-    void AdvanceSlice(uint32_t s0, uint32_t s1)
+    void AdvanceSlice(uint32_t s0, uint32_t s1, double win_len)
     {
         uint32_t prev_slice = current_slice_;
+
+        // Compute absolute position BEFORE reset (for fade head)
+        double old_abs = static_cast<double>(last_adj_start_) + read_pos_;
 
         slice_timer_ = 0.0;
         read_pos_    = 0.0;
@@ -431,47 +465,44 @@ class PlaybackEngine
             current_slice_ = s0;
         }
 
-        // Only crossfade if slices are NOT contiguous (e.g., loop wrap).
-        // For contiguous slices, audio is continuous — crossfade would
-        // only introduce artifacts via pitch shifter state interaction.
-        bool need_xfade = true;
-        if(slices_)
+        // Buffer fade + phase reset for non-contiguous transitions
+        // When swing is active, always crossfade — even groups may have
+        // held their last sample, creating a micro-discontinuity.
+        bool contiguous = false;
+        if(prev_slice != current_slice_ && slices_)
         {
             const SlotHeader& hdr = slices_->GetHeader();
             uint32_t pi = ClampU(prev_slice, hdr.num_slices);
             uint32_t ni = ClampU(current_slice_, hdr.num_slices);
-            // Contiguous: next slice starts where previous ended
-            if(hdr.slices[pi].start_sample + hdr.slices[pi].length
-               == hdr.slices[ni].start_sample)
-            {
-                need_xfade = false;
-            }
+            contiguous = (hdr.slices[pi].start_sample + hdr.slices[pi].length
+                          == hdr.slices[ni].start_sample);
         }
 
-        if(need_xfade)
+        bool needs_fade = !contiguous || (swing_ > 0.001f);
+
+        if(needs_fade)
         {
-            xfade_prev_l_ = prev_out_l_;
-            xfade_prev_r_ = prev_out_r_;
-            // Reset pitch shifters at discontinuity (loop wrap, knob jump)
-            // so WSOLA doesn't mix old-end audio with new-start audio
-            pitch_l_.SoftReset();
-            pitch_r_.SoftReset();
-            if(slices_)
+            StartFade(old_abs, win_len);
+            if(fabsf(pitch_l_.GetFactor() - 1.0f) >= 0.01f)
             {
-                const SlotHeader& hdr = slices_->GetHeader();
-                uint32_t sidx = ClampU(current_slice_, hdr.num_slices);
-                xfade_total_   = AdaptiveXfade(hdr.slices[sidx].length);
-                xfade_counter_ = xfade_total_;
-            }
-            else
-            {
-                xfade_total_   = XFADE_MAX;
-                xfade_counter_ = XFADE_MAX;
+                pitch_l_.ResetForDiscontinuity();
+                pitch_r_.ResetForDiscontinuity();
             }
         }
+    }
 
-        gate_was_open_ = true;
-        gate_fade_counter_ = 0; gate_fadein_counter_ = 0;
+    /** Start a buffer-level crossfade from old_abs position.
+     *  Caps length to 25% of window so fast roll isn't all-fade. */
+    void StartFade(double old_abs, double win_len)
+    {
+        fade_abs_pos_ = old_abs;
+        uint32_t len = FADE_LEN;
+        // Cap to 25% of window for fast roll
+        uint32_t max_len = static_cast<uint32_t>(win_len * 0.25);
+        if(max_len < 64) max_len = 64;
+        if(len > max_len) len = max_len;
+        fade_total_ = len;
+        fade_counter_ = len;
     }
 
     static float Clampf(float v, float lo, float hi)
@@ -532,13 +563,23 @@ class PlaybackEngine
     uint32_t current_slice_ = 0;
 
     float    speed_ratio_   = 1.0f;
-    float    slice_gate_    = 1.0f;
+    float    bpm_ratio_     = 1.0f;
+    float    swing_         = 0.0f;
+    double   current_window_len_ = 0.0;  // Actual swung window for progress
+    uint32_t last_adj_start_ = 0;
     bool     is_playing_    = false;
 
     double   read_pos_      = 0.0;
     double   slice_timer_   = 0.0;
 
-    // Crossfade
+    // Buffer-level crossfade (softcut-style dual read head).
+    // When read_pos_ jumps, the fade head continues from the old
+    // absolute buffer position and fades out over FADE_LEN samples.
+    // The blended stream feeds the pitch shifter — no discontinuity.
+    static constexpr uint32_t FADE_LEN = 1024;  // = 1 FFT window
+    double   fade_abs_pos_  = 0.0;   // Absolute position in slot buffer
+    uint32_t fade_counter_  = 0;     // Samples remaining (0 = inactive)
+    uint32_t fade_total_    = FADE_LEN;
     float    prev_out_l_    = 0.0f;
     float    prev_out_r_    = 0.0f;
     float    xfade_prev_l_  = 0.0f;
@@ -555,11 +596,6 @@ class PlaybackEngine
         if(xf < 16) xf = 16;
         return xf;
     }
-
-    // Gate fade
-    uint32_t gate_fade_counter_ = 0;
-    uint32_t gate_fadein_counter_ = 0;
-    bool     gate_was_open_     = true;
 
     // Play mode
     PlaybackMode play_mode_  = PlaybackMode::LOOP;
